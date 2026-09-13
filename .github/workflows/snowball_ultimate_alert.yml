@@ -1,0 +1,26 @@
+name: TQQQ Alert
+
+on:
+  schedule:
+    - cron: '15 20 * * 1-5'  # 기존 김째매매법과 동일한 UTC 20:15 / 한국시간 기준 알림 시각
+  workflow_dispatch:
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Ultimate alert
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python Snowball_TQQQ_ULTIMATE_ALERT_v2.0.py
