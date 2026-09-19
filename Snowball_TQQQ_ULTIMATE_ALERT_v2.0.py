@@ -909,21 +909,28 @@ def calc_signal():
     data = download_data()
     data = prepare_indicators(data)
 
-    # GitHub Actions는 평일마다 실행하지만, 미국장 휴장일에는
-    # TQQQ의 신규 일봉이 생기지 않습니다. 최신 TQQQ 거래일이
-    # 오늘(미 동부시간 기준)이 아니면 아무 알림도 보내지 않습니다.
-    now_ny = pd.Timestamp.now(tz="America/New_York")
+    # --------------------------------------------------------
+    # 기존 alert.py 방식과 동일하게
+    # Yahoo Finance에서 받은 마지막 유효 TQQQ 거래일을 사용한다.
+    #
+    # 중요:
+    # - 미국 동부시간 '오늘 날짜'와 일치하는지 검사하지 않는다.
+    # - 미국장 휴장일에는 가장 최근 확정 거래일을 사용한다.
+    # - Ultimate 전략 계산/Replay 로직은 변경하지 않는다.
+    # --------------------------------------------------------
     latest_tqqq = data["TQQQ_CLOSE"].dropna().index.max()
 
-    if latest_tqqq is None or latest_tqqq.date() != now_ny.date():
-        print(
-            f"[SKIP] 미국장 신규 TQQQ 일봉 없음: "
-            f"latest={latest_tqqq}, NY={now_ny.date()}"
-        )
+    if pd.isna(latest_tqqq):
+        print("[SKIP] 유효한 TQQQ 일봉 데이터가 없습니다.")
         return
 
-    # 마지막 확정 거래일만 알림 대상으로 사용.
+    # 마지막 확정 TQQQ 거래일
     today = latest_tqqq
+
+    print(
+        f"[DATA] Ultimate 기준일: "
+        f"{today.strftime('%Y-%m-%d')}"
+    )
 
     state = load_state()
 
