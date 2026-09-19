@@ -505,10 +505,13 @@ def replay(df, state, send_alerts=False):
             reason = state["pending_reason"]
 
             # slippage=1 tick의 보수적 근사
-            if action > 0:
-                fill_price = open_ + MIN_TICK
-            else:
-                fill_price = max(open_ - MIN_TICK, MIN_TICK)
+            # TradingView:
+            # process_orders_on_close=false
+            # → 신호 다음 봉 OPEN 체결
+            #
+            # Pine의 fillPrice 역시 open이므로
+            # 평균단가 계산에는 ±1 tick을 넣지 않는다.
+            fill_price = open_
 
             if action == 1:  # DIP1
                 equity_before = mark_equity(state, open_)
@@ -628,9 +631,11 @@ def replay(df, state, send_alerts=False):
         # ----------------------------------------------------
         # C. GC memory
         # ----------------------------------------------------
+        # TradingView와 동일하게 최초 GC만 memory에 저장
         if bool(row["gc_confirmed"]):
-            gc_bar_index = i
-            state["gc_bar"] = i
+            if gc_bar_index is None:
+                gc_bar_index = i
+                state["gc_bar"] = i
 
         gc_eligible = (
             gc_bar_index is not None
