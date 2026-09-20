@@ -2,35 +2,28 @@
 # -*- coding: utf-8 -*-
 
 """
-눈덩이 TQQQ ULTIMATE v2.0 - TradingView Sync + Daily Status
-------------------------------------------------------------
+눈덩이 TQQQ ULTIMATE - TradingView Pine MATCH Alert
+----------------------------------------------------
 목적:
-  규칙.txt의 "Snowball TQQQ ULTIMATE FINAL v2.0" 신호 구조를
-  Python에서 일일 종가 기준으로 재현하고 Telegram으로 알립니다.
+  현재 확정된 TradingView Pine v6 코드의 일봉 신호를
+  Python에서 최대한 동일한 조건으로 재현하고
+  신호가 발생한 당일 종가 확정 후 Telegram으로 알림.
 
-TradingView Sync 패치:
-  1. GC memory는 최초 GC만 저장
-  2. 신호일 종가에서 BUY 수량 계산
-  3. 계산된 pending_qty를 다음 봉 OPEN에서 그대로 체결
-  4. 평균단가는 실제 다음 봉 OPEN 체결가격으로 계산
-  5. DC 발생 시 GC memory 제거
-  6. pending_qty 상태 저장/초기화
+핵심 원칙:
+  1) Pine의 GC/DC Gap 조건 그대로 사용
+  2) Pine의 QQQ DD / TQQQ Z200 / VIX / Credit 조건 그대로 사용
+  3) Pine의 자동 시장상태 DOWN / UP/BOTTOM / NEUTRAL 그대로 사용
+  4) Pine의 TP2 자동 연동(+90/45, +100/35, +115/25) 그대로 사용
+  5) Pine의 한 봉 한 액션 우선순위 그대로 사용
+  6) Pine의 Stage / avgPrice / TP 상태 변이를 그대로 재현
+  7) 알림은 "신호일 종가" 기준으로 전송
+  8) 별도의 다음날 OPEN 체결 로직은 사용하지 않음
 
-Daily Status:
-  - 매일 마지막 확정 거래일 기준 현황 전송
-  - TQQQ 종가 + 전일 대비 등락률
-  - QQQ 종가
-  - Nasdaq-100 선물(NQ=F)
-  - 현재 시장상태: NONE / UP/BOTTOM / DOWN
-  - 오늘 행동지침
-
-중요:
-  - 자동매매 주문기가 아니라 "알림 엔진"입니다.
-  - 신호는 "신호일 종가 확정 -> 다음 정규장 OPEN" 기준입니다.
-  - 실제 증권계좌 체결과 Python 가상 포지션은 다를 수 있습니다.
-  - EQDD/TP2/cycleBaseQty/TP3 Lock을 포함하기 위해
-    로컬 상태 파일을 사용합니다.
-  - 첫 실행 시 2010-02-11부터 데이터를 재생해 상태를 복원합니다.
+주의:
+  - TradingView와 Yahoo Finance 데이터가 완전히 동일하지 않을 수 있으므로,
+    데이터 제공처 차이 때문에 일부 날짜에서 차이가 날 가능성은 있음.
+  - 아래 전략 상수는 현재 TradingView Pine 코드의 기본값과 동일하게 맞춰져 있음.
+  - TradingView에서 입력값을 바꾸면 이 Python 상수도 동일하게 바꿔야 함.
 
 필수 환경변수:
   TELEGRAM_BOT_TOKEN
@@ -40,12 +33,11 @@ Daily Status:
   pip install yfinance pandas requests
 
 실행:
-  python Snowball_TQQQ_ULTIMATE_ALERT_v2.0_TV_SYNC_PATCHED.py
+  python Snowball_TQQQ_ULTIMATE_TV_MATCH.py
 """
 
 import html
 import json
-import math
 import os
 from pathlib import Path
 
@@ -55,67 +47,54 @@ import yfinance as yf
 
 
 # ============================================================
-# 0. SETTINGS — 규칙.txt Ultimate v2.0
+# 0. SETTINGS - 현재 TradingView Pine v6 기본값과 동일
 # ============================================================
 
 START_DATE = "2010-02-11"
+DOWNLOAD_START = "2009-01-01"
 
 FAST_LEN = 5
 SLOW_LEN = 220
+MA200_LEN = 200
 
-GC_BAND = 2.90
-DC_BAND = -0.10
-GC_DELAY = 0
+GC_PCT = 2.90
+DC_PCT = -0.10
 
-DIP1 = 10.0
-DIP1_WEIGHT = 30.0
+DIP_LOOKBACK = 126
+DIP1_BASE_PCT = -10.0
+DIP1_VIX_PCT = -12.0
+DIP1_EXTREME_PCT = -14.0
+DIP2_PCT = -22.0
+DIP2_Z200_MAX = -7.0
+MAX_DIP_LIMIT = -40.0
+USE_VIX_DIP = True
 
-DIP2 = 22.0
-DIP2_WEIGHT = 70.0
-DIP2_FILTER_LEN = 200
-DIP2_FILTER_PCT = -7.0
+VIX_NORMAL = 1.03
+VIX_EXTREME = 1.08
 
-PEAK_LEN = 126
-
-USE_VIX = True
 USE_CREDIT = True
-USE_EQDD = True
-
-EQ_START = 27.5
-EQ_FULL = 37.5
-EQ_MIN = 0.475
-
-USE_RSI = False
-RSI_LEN = 14
-
-SAFETY_FACTOR = 99.0
-CASH_BUFFER = 0.2
-MAX_DIP = 40.0
-
-COOLDOWN_DAYS = 0
+CREDIT_ROC_LEN = 5
+QQQ_CRASH_LEN = 20
+QQQ_CRASH_PCT = -8.0
 
 TP1_PCT = 15.0
-TP1_SELL_PCT = 50.0
+TP1_SELL_PCT = 50
 
-TP2_DOWN = 90.0
-TP2_DOWN_SELL = 45.0
+TP2_DOWN_PCT = 90.0
+TP2_DOWN_SELL_PCT = 45
 
-TP2_NONE = 100.0
-TP2_NONE_SELL = 35.0
+TP2_NONE_PCT = 100.0
+TP2_NONE_SELL_PCT = 35
 
-TP2_UP = 115.0
-TP2_UP_SELL = 25.0
+TP2_UP_PCT = 115.0
+TP2_UP_SELL_PCT = 25
 
 TP3_PCT = 350.0
 
-INITIAL_CAPITAL = 10000.0
-
-COMMISSION = 0.0005       # 0.05%
-SLIPPAGE_TICKS = 1
-MIN_TICK = 0.01
+MY_AVG_PRICE = 0.0
 
 STATE_FILE = Path(__file__).with_name(
-    "snowball_ultimate_alert_state.json"
+    "snowball_tv_match_state.json"
 )
 
 
@@ -123,22 +102,15 @@ STATE_FILE = Path(__file__).with_name(
 # 1. TELEGRAM
 # ============================================================
 
-BOT_TOKEN = os.environ.get(
-    "TELEGRAM_BOT_TOKEN"
-)
-
-CHAT_ID = os.environ.get(
-    "TELEGRAM_CHAT_ID"
-)
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 
 def send_telegram(msg: str):
 
     if not BOT_TOKEN or not CHAT_ID:
-
         raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID "
-            "환경변수가 없습니다."
+            "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 환경변수가 없습니다."
         )
 
     url = (
@@ -146,7 +118,7 @@ def send_telegram(msg: str):
         f"bot{BOT_TOKEN}/sendMessage"
     )
 
-    r = requests.post(
+    response = requests.post(
         url,
         data={
             "chat_id": CHAT_ID,
@@ -157,14 +129,14 @@ def send_telegram(msg: str):
         timeout=20,
     )
 
-    r.raise_for_status()
+    response.raise_for_status()
 
 
 # ============================================================
 # 2. DATA
 # ============================================================
 
-TICKERS = {
+SYMBOLS = {
     "TQQQ": "TQQQ",
     "QQQ": "QQQ",
     "VIX": "^VIX",
@@ -174,708 +146,853 @@ TICKERS = {
 }
 
 
-def download_data():
+def _download_series(
+    ticker: str,
+    start: str,
+    end: str
+) -> pd.Series:
 
-    # --------------------------------------------------------
-    # 200/220일선 및 초기 warm-up 확보
-    # --------------------------------------------------------
-    end = (
-        pd.Timestamp.now(
-            tz="America/New_York"
-        ).normalize()
-        + pd.Timedelta(days=2)
-    ).strftime("%Y-%m-%d")
-
-    raw = yf.download(
-        list(TICKERS.values()),
-        start="2009-01-01",
+    data = yf.download(
+        ticker,
+        start=start,
         end=end,
         auto_adjust=False,
         progress=False,
+        threads=False,
         group_by="column",
-        threads=True,
     )
 
-    if raw.empty:
-
+    if data.empty:
         raise RuntimeError(
-            "Yahoo Finance 데이터를 받지 못했습니다."
+            f"{ticker}: 데이터를 받지 못했습니다."
         )
 
-    out = {}
-
-    for name, ticker in TICKERS.items():
-
-        try:
-
-            if isinstance(
-                raw.columns,
-                pd.MultiIndex
-            ):
-
-                if (
-                    ticker
-                    in raw.columns.get_level_values(0)
-                ):
-
-                    df = raw[ticker].copy()
-
-                elif (
-                    ticker
-                    in raw.columns.get_level_values(1)
-                ):
-
-                    df = raw.xs(
-                        ticker,
-                        axis=1,
-                        level=1
-                    ).copy()
-
-                else:
-
-                    raise KeyError(ticker)
-
-            else:
-
-                df = raw.copy()
-
-            if isinstance(
-                df,
-                pd.DataFrame
-            ):
-
-                if "Close" not in df.columns:
-
-                    raise KeyError(
-                        f"{ticker}: Close 없음"
-                    )
-
-                s = df["Close"]
-
-            else:
-
-                s = df
-
-            s = pd.to_numeric(
-                s,
-                errors="coerce"
-            )
-
-            s.index = pd.to_datetime(
-                s.index
-            ).tz_localize(None)
-
-            out[name] = s.rename(name)
-
-        except Exception as e:
-
-            raise RuntimeError(
-                f"{name}({ticker}) 데이터 처리 실패: {e}"
-            )
-
-    # --------------------------------------------------------
-    # TQQQ OHLC
-    # --------------------------------------------------------
-    t = yf.download(
-        "TQQQ",
-        start="2009-01-01",
-        end=end,
-        auto_adjust=False,
-        progress=False,
-    )
-
     if isinstance(
-        t.columns,
+        data.columns,
         pd.MultiIndex
     ):
 
-        t.columns = (
-            t.columns
-            .get_level_values(0)
+        if (
+            ticker
+            in data.columns.get_level_values(0)
+        ):
+
+            data = data[ticker]
+
+        elif (
+            ticker
+            in data.columns.get_level_values(1)
+        ):
+
+            data = data.xs(
+                ticker,
+                axis=1,
+                level=1
+            )
+
+    if "Close" not in data.columns:
+
+        raise RuntimeError(
+            f"{ticker}: Close 컬럼이 없습니다."
         )
 
-    t.index = pd.to_datetime(
-        t.index
+    series = pd.to_numeric(
+        data["Close"],
+        errors="coerce"
+    )
+
+    series.index = pd.to_datetime(
+        series.index
     ).tz_localize(None)
 
-    for c in [
+    return series.rename(ticker)
+
+
+def _download_ohlc(
+    ticker: str,
+    start: str,
+    end: str
+) -> pd.DataFrame:
+
+    data = yf.download(
+        ticker,
+        start=start,
+        end=end,
+        auto_adjust=False,
+        progress=False,
+        threads=False,
+        group_by="column",
+    )
+
+    if data.empty:
+
+        raise RuntimeError(
+            f"{ticker}: OHLC 데이터를 받지 못했습니다."
+        )
+
+    if isinstance(
+        data.columns,
+        pd.MultiIndex
+    ):
+
+        if (
+            ticker
+            in data.columns.get_level_values(0)
+        ):
+
+            data = data[ticker]
+
+        elif (
+            ticker
+            in data.columns.get_level_values(1)
+        ):
+
+            data = data.xs(
+                ticker,
+                axis=1,
+                level=1
+            )
+
+    needed = [
         "Open",
         "High",
         "Low",
         "Close"
-    ]:
+    ]
 
-        t[c] = pd.to_numeric(
-            t[c],
+    missing = [
+        c
+        for c in needed
+        if c not in data.columns
+    ]
+
+    if missing:
+
+        raise RuntimeError(
+            f"{ticker}: OHLC 컬럼 누락 {missing}"
+        )
+
+    data = data[
+        needed
+    ].copy()
+
+    for col in needed:
+
+        data[col] = pd.to_numeric(
+            data[col],
             errors="coerce"
         )
 
-    out["TQQQ_OPEN"] = (
-        t["Open"]
-        .rename("TQQQ_OPEN")
-    )
-
-    out["TQQQ_CLOSE"] = (
-        t["Close"]
-        .rename("TQQQ_CLOSE")
-    )
-
-    data = pd.concat(
-        out.values(),
-        axis=1
-    ).sort_index()
-
-    data = data[
-        ~data.index.duplicated(
-            keep="last"
-        )
-    ]
+    data.index = pd.to_datetime(
+        data.index
+    ).tz_localize(None)
 
     return data
 
 
+def download_data() -> pd.DataFrame:
+
+    end = (
+        pd.Timestamp.now(
+            tz="America/New_York"
+        ).normalize()
+        + pd.Timedelta(days=3)
+    ).strftime("%Y-%m-%d")
+
+    tqqq_ohlc = _download_ohlc(
+        "TQQQ",
+        DOWNLOAD_START,
+        end
+    )
+
+    qqq_ohlc = _download_ohlc(
+        "QQQ",
+        DOWNLOAD_START,
+        end
+    )
+
+    vix = _download_series(
+        "^VIX",
+        DOWNLOAD_START,
+        end
+    )
+
+    vix3m = _download_series(
+        "^VIX3M",
+        DOWNLOAD_START,
+        end
+    )
+
+    hyg = _download_series(
+        "HYG",
+        DOWNLOAD_START,
+        end
+    )
+
+    lqd = _download_series(
+        "LQD",
+        DOWNLOAD_START,
+        end
+    )
+
+    df = pd.concat(
+        [
+            tqqq_ohlc.add_prefix(
+                "TQQQ_"
+            ),
+            qqq_ohlc.add_prefix(
+                "QQQ_"
+            ),
+            vix,
+            vix3m,
+            hyg,
+            lqd,
+        ],
+        axis=1
+    ).sort_index()
+
+    df = df[
+        ~df.index.duplicated(
+            keep="last"
+        )
+    ]
+
+    return df
+
+
 # ============================================================
-# 2-1. Nasdaq-100 Futures
+# 3. WEEKLY VALUES
 # ============================================================
 
-def get_nasdaq_futures():
+def add_weekly_state_columns(
+    x: pd.DataFrame
+) -> pd.DataFrame:
+
     """
-    Nasdaq-100 E-mini 선물:
-        Yahoo Finance ticker = NQ=F
+    Pine:
 
-    전략 계산에는 사용하지 않고
-    Telegram 일일현황 표시용으로만 사용한다.
+      request.security(
+        syminfo.tickerid,
+        "W",
+        [
+          close[1],
+          ta.sma(close, 5)[1],
+          ta.sma(close, 20)[1],
+          ta.sma(close, 5)[3]
+        ],
+        lookahead=barmerge.lookahead_on
+      )
+
+    현재 일봉 차트 기준:
+      현재 주봉 → 이전 완료 주봉 값을 사용.
     """
 
-    try:
+    tclose = x[
+        "TQQQ_Close"
+    ].copy()
 
-        nq = yf.download(
-            "NQ=F",
-            period="5d",
-            interval="5m",
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-        )
-
-        if nq.empty:
-
-            return None, None
-
-        if isinstance(
-            nq.columns,
-            pd.MultiIndex
-        ):
-
-            nq.columns = (
-                nq.columns
-                .get_level_values(0)
-            )
-
-        nq = nq.dropna(
-            subset=["Close"]
-        )
-
-        if nq.empty:
-
-            return None, None
-
-        latest_price = float(
-            nq["Close"].iloc[-1]
-        )
-
-        # ----------------------------------------------------
-        # 전일 종가
-        # ----------------------------------------------------
-        daily = yf.download(
-            "NQ=F",
-            period="10d",
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-        )
-
-        if isinstance(
-            daily.columns,
-            pd.MultiIndex
-        ):
-
-            daily.columns = (
-                daily.columns
-                .get_level_values(0)
-            )
-
-        daily = daily.dropna(
-            subset=["Close"]
-        )
-
-        if len(daily) >= 2:
-
-            prev_close = float(
-                daily["Close"].iloc[-2]
-            )
-
-        else:
-
-            prev_close = None
-
-        if (
-            prev_close is not None
-            and prev_close > 0
-        ):
-
-            change_pct = (
-                latest_price
-                / prev_close
-                - 1.0
-            ) * 100.0
-
-        else:
-
-            change_pct = None
-
-        return (
-            latest_price,
-            change_pct
-        )
-
-    except Exception as e:
-
-        print(
-            f"[WARN] NQ=F 데이터 조회 실패: {e}"
-        )
-
-        return None, None
-
-
-# ============================================================
-# 3. INDICATORS
-# ============================================================
-
-def rsi(
-    series,
-    length=14
-):
-
-    delta = series.diff()
-
-    gain = delta.clip(
-        lower=0
-    )
-
-    loss = -delta.clip(
-        upper=0
-    )
-
-    avg_gain = gain.ewm(
-        alpha=1 / length,
-        min_periods=length,
-        adjust=False
-    ).mean()
-
-    avg_loss = loss.ewm(
-        alpha=1 / length,
-        min_periods=length,
-        adjust=False
-    ).mean()
-
-    rs = (
-        avg_gain
-        / avg_loss.replace(
-            0,
-            pd.NA
-        )
-    )
-
-    return 100 - (
-        100 / (1 + rs)
-    )
-
-
-def prepare_indicators(df):
-
-    x = df.copy()
-
-    q = x["QQQ"]
-    t = x["TQQQ_CLOSE"]
-
-    # --------------------------------------------------------
-    # QQQ DD
-    # --------------------------------------------------------
-    x["q_peak"] = q.rolling(
-        PEAK_LEN
-    ).max()
-
-    x["q_dd"] = (
-        q / x["q_peak"]
-        - 1.0
-    ) * 100.0
-
-    # --------------------------------------------------------
-    # QQQ filters
-    # --------------------------------------------------------
-    x["q_fast"] = q.rolling(
-        FAST_LEN
-    ).mean()
-
-    x["q_slow"] = q.rolling(
-        SLOW_LEN
-    ).mean()
-
-    x["q_filter"] = q.rolling(
-        DIP2_FILTER_LEN
-    ).mean()
-
-    # --------------------------------------------------------
-    # TQQQ MA
-    # --------------------------------------------------------
-    x["t_fast"] = t.rolling(
-        FAST_LEN
-    ).mean()
-
-    x["t_slow"] = t.rolling(
-        SLOW_LEN
-    ).mean()
-
-    x["t_200"] = t.rolling(
-        DIP2_FILTER_LEN
-    ).mean()
-
-    # --------------------------------------------------------
-    # GC / DC
-    # --------------------------------------------------------
-    prev_fast = (
-        x["t_fast"].shift(1)
-    )
-
-    prev_slow = (
-        x["t_slow"].shift(1)
-    )
-
-    x["gc_cross"] = (
-        (prev_fast <= prev_slow)
-        &
-        (x["t_fast"] > x["t_slow"])
-    )
-
-    x["dc_cross"] = (
-        (prev_fast >= prev_slow)
-        &
-        (x["t_fast"] < x["t_slow"])
-    )
-
-    x["gc_band"] = (
-        x["t_fast"]
-        >= x["t_slow"]
-        * (
-            1
-            + GC_BAND / 100
-        )
-    )
-
-    x["dc_band"] = (
-        x["t_fast"]
-        <= x["t_slow"]
-        * (
-            1
-            + DC_BAND / 100
-        )
-    )
-
-    x["gc_confirmed"] = (
-        x["gc_cross"]
-        & x["gc_band"]
-    )
-
-    x["dc_confirmed"] = (
-        x["dc_cross"]
-        & x["dc_band"]
-    )
-
-    # --------------------------------------------------------
-    # VIX
-    # --------------------------------------------------------
-    x["vix_ratio"] = (
-        x["VIX"]
-        / x["VIX3M"]
-    )
-
-    x["dip1_threshold"] = DIP1
-
-    x.loc[
-        x["vix_ratio"] > 1.03,
-        "dip1_threshold"
-    ] = 12.0
-
-    x.loc[
-        x["vix_ratio"] > 1.08,
-        "dip1_threshold"
-    ] = 14.0
-
-    if not USE_VIX:
-
-        x["dip1_threshold"] = DIP1
-
-    # --------------------------------------------------------
-    # Credit
-    # --------------------------------------------------------
-    x["hyg_roc5"] = (
-        x["HYG"].pct_change(5)
-        * 100
-    )
-
-    x["lqd_roc5"] = (
-        x["LQD"].pct_change(5)
-        * 100
-    )
-
-    x["credit_roc"] = (
-        x["hyg_roc5"]
-        + x["lqd_roc5"]
-    ) / 2
-
-    x["credit_ok"] = (
-        True
-        if not USE_CREDIT
-        else (
-            x["credit_roc"] > 0
-        )
-    )
-
-    # --------------------------------------------------------
-    # Weekly trend
-    # --------------------------------------------------------
     weekly = (
-        t.resample("W-FRI")
+        tclose
+        .resample("W-FRI")
         .last()
-        .to_frame("wclose")
+        .dropna()
+        .to_frame("close")
     )
 
     weekly["w5"] = (
-        weekly["wclose"]
-        .rolling(5)
+        weekly["close"]
+        .rolling(
+            5,
+            min_periods=5
+        )
         .mean()
     )
 
     weekly["w20"] = (
-        weekly["wclose"]
-        .rolling(20)
+        weekly["close"]
+        .rolling(
+            20,
+            min_periods=20
+        )
         .mean()
     )
 
-    weekly["w5_rising"] = (
+    weekly["prev_close"] = (
+        weekly["close"]
+        .shift(1)
+    )
+
+    weekly["prev_w5"] = (
         weekly["w5"]
-        > weekly["w5"].shift(2)
+        .shift(1)
     )
 
-    x["wclose"] = (
-        weekly["wclose"]
-        .reindex(
-            x.index,
-            method="ffill"
-        )
-    )
-
-    x["w5"] = (
-        weekly["w5"]
-        .reindex(
-            x.index,
-            method="ffill"
-        )
-    )
-
-    x["w20"] = (
+    weekly["prev_w20"] = (
         weekly["w20"]
-        .reindex(
-            x.index,
-            method="ffill"
-        )
+        .shift(1)
     )
 
-    x["w5_rising"] = (
-        weekly["w5_rising"]
-        .reindex(
-            x.index,
-            method="ffill"
-        )
+    weekly["prev_w5_2w"] = (
+        weekly["w5"]
+        .shift(3)
     )
 
-    # --------------------------------------------------------
-    # UP / BOTTOM
-    # --------------------------------------------------------
-    x["up_raw"] = (
-        (x["w5"] > x["w20"])
-        &
-        (x["wclose"] > x["w20"])
+    week_key = (
+        x.index
+        .to_period("W-FRI")
+        .end_time
+        .normalize()
     )
 
-    x["bottom"] = (
-        (x["q_dd"] <= -15.0)
-        &
-        x["w5_rising"].fillna(False)
+    week_key = pd.DatetimeIndex(
+        week_key
     )
 
-    # --------------------------------------------------------
-    # Hazard
-    # --------------------------------------------------------
-    hazard1 = (
-        x["vix_ratio"] > 1.08
+    lookup = weekly[
+        [
+            "prev_close",
+            "prev_w5",
+            "prev_w20",
+            "prev_w5_2w",
+        ]
+    ].copy()
+
+    lookup.index = (
+        pd.DatetimeIndex(
+            lookup.index
+        ).normalize()
     )
 
-    hazard2 = (
-        (x["hyg_roc5"] < 0)
-        &
-        (x["lqd_roc5"] < 0)
+    mapped = lookup.reindex(
+        week_key
     )
 
-    hazard3 = (
-        x["QQQ"].pct_change(20)
-        < -0.08
+    mapped.index = x.index
+
+    x["stateWeeklyClose"] = (
+        mapped[
+            "prev_close"
+        ].to_numpy()
     )
 
-    x["hazard_count"] = (
-        hazard1
-        .fillna(False)
-        .astype(int)
+    x["stateWeeklyMA5"] = (
+        mapped[
+            "prev_w5"
+        ].to_numpy()
     )
 
-    x["hazard_count"] += (
-        hazard2
-        .fillna(False)
-        .astype(int)
+    x["stateWeeklyMA20"] = (
+        mapped[
+            "prev_w20"
+        ].to_numpy()
     )
 
-    x["hazard_count"] += (
-        hazard3
-        .fillna(False)
-        .astype(int)
+    x["stateWeeklyMA5_2W"] = (
+        mapped[
+            "prev_w5_2w"
+        ].to_numpy()
     )
-
-    # --------------------------------------------------------
-    # DOWN / UP
-    # --------------------------------------------------------
-    x["down_state"] = (
-        (
-            (x["w5"] < x["w20"])
-            &
-            (x["wclose"] < x["w20"])
-        )
-        |
-        (x["hazard_count"] >= 2)
-    )
-
-    x["up_state"] = (
-        ~x["down_state"]
-        &
-        (
-            x["up_raw"]
-            |
-            x["bottom"]
-        )
-    )
-
-    # --------------------------------------------------------
-    # TP2 state
-    # --------------------------------------------------------
-    x["tp2_state"] = "NONE"
-
-    x.loc[
-        x["down_state"],
-        "tp2_state"
-    ] = "DOWN"
-
-    x.loc[
-        x["up_state"] & x["bottom"],
-        "tp2_state"
-    ] = "BOTTOM"
-
-    x.loc[
-        x["up_state"] & ~x["bottom"],
-        "tp2_state"
-    ] = "UP"
-
-    x["tp2_trigger"] = TP2_NONE
-
-    x.loc[
-        x["down_state"],
-        "tp2_trigger"
-    ] = TP2_DOWN
-
-    x.loc[
-        x["up_state"],
-        "tp2_trigger"
-    ] = TP2_UP
-
-    x["tp2_sell_pct"] = TP2_NONE_SELL
-
-    x.loc[
-        x["down_state"],
-        "tp2_sell_pct"
-    ] = TP2_DOWN_SELL
-
-    x.loc[
-        x["up_state"],
-        "tp2_sell_pct"
-    ] = TP2_UP_SELL
-
-    # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
-    x["rsi"] = rsi(
-        t,
-        RSI_LEN
-    )
-
-    x["rsi_bonus"] = 0.0
-
-    if USE_RSI:
-
-        x.loc[
-            x["rsi"] < 35,
-            "rsi_bonus"
-        ] = 5.0
-
-        x.loc[
-            x["rsi"] < 30,
-            "rsi_bonus"
-        ] = 7.5
 
     return x
 
 
 # ============================================================
-# 4. STATE
+# 4. INDICATORS
+# ============================================================
+
+def prepare_indicators(
+    df: pd.DataFrame
+) -> pd.DataFrame:
+
+    x = df.copy()
+
+    close = x[
+        "TQQQ_Close"
+    ]
+
+    qqq_close = x[
+        "QQQ_Close"
+    ]
+
+    qqq_high = x[
+        "QQQ_High"
+    ]
+
+    # --------------------------------------------------------
+    # TQQQ MA
+    # --------------------------------------------------------
+
+    x["ma5"] = (
+        close
+        .rolling(
+            FAST_LEN,
+            min_periods=FAST_LEN
+        )
+        .mean()
+    )
+
+    x["ma200"] = (
+        close
+        .rolling(
+            MA200_LEN,
+            min_periods=MA200_LEN
+        )
+        .mean()
+    )
+
+    x["ma220"] = (
+        close
+        .rolling(
+            SLOW_LEN,
+            min_periods=SLOW_LEN
+        )
+        .mean()
+    )
+
+    # --------------------------------------------------------
+    # GC / DC Gap
+    # --------------------------------------------------------
+
+    x["gc_gap"] = (
+        x["ma5"]
+        - x["ma220"]
+    ) / x["ma220"]
+
+    x["gc_gap_prev"] = (
+        x["gc_gap"]
+        .shift(1)
+    )
+
+    gc_threshold = (
+        GC_PCT / 100.0
+    )
+
+    dc_threshold = (
+        abs(DC_PCT) / 100.0
+    )
+
+    x["goldCross"] = (
+        x["gc_gap"].notna()
+        &
+        x["gc_gap_prev"].notna()
+        &
+        (
+            x["gc_gap_prev"]
+            < gc_threshold
+        )
+        &
+        (
+            x["gc_gap"]
+            >= gc_threshold
+        )
+    )
+
+    x["deadCross"] = (
+        x["gc_gap"].notna()
+        &
+        x["gc_gap_prev"].notna()
+        &
+        (
+            x["gc_gap_prev"]
+            > -dc_threshold
+        )
+        &
+        (
+            x["gc_gap"]
+            <= -dc_threshold
+        )
+    )
+
+    # --------------------------------------------------------
+    # QQQ DD
+    # Pine: ta.highest(high, 126)
+    # --------------------------------------------------------
+
+    x["qqq_high_126"] = (
+        qqq_high
+        .rolling(
+            DIP_LOOKBACK,
+            min_periods=DIP_LOOKBACK
+        )
+        .max()
+    )
+
+    x["qqq_dd"] = (
+        qqq_close
+        / x["qqq_high_126"]
+        - 1.0
+    ) * 100.0
+
+    # --------------------------------------------------------
+    # QQQ 200MA
+    # --------------------------------------------------------
+
+    x["qqq_ma200"] = (
+        qqq_close
+        .rolling(
+            MA200_LEN,
+            min_periods=MA200_LEN
+        )
+        .mean()
+    )
+
+    x["qqq_z200"] = (
+        qqq_close
+        / x["qqq_ma200"]
+        - 1.0
+    ) * 100.0
+
+    # --------------------------------------------------------
+    # TQQQ Z200
+    # --------------------------------------------------------
+
+    x["tqqq_z200"] = (
+        close
+        / x["ma200"]
+        - 1.0
+    ) * 100.0
+
+    # --------------------------------------------------------
+    # VIX / VIX3M
+    # --------------------------------------------------------
+
+    x["vixRatio"] = (
+        x["VIX"]
+        / x["VIX3M"]
+    )
+
+    def dip1_trigger(row):
+
+        ratio = row[
+            "vixRatio"
+        ]
+
+        if (
+            not USE_VIX_DIP
+            or pd.isna(ratio)
+        ):
+
+            return DIP1_BASE_PCT
+
+        if ratio > VIX_EXTREME:
+
+            return DIP1_EXTREME_PCT
+
+        if ratio > VIX_NORMAL:
+
+            return DIP1_VIX_PCT
+
+        return DIP1_BASE_PCT
+
+    x["dip1Trigger"] = (
+        x.apply(
+            dip1_trigger,
+            axis=1
+        )
+    )
+
+    # --------------------------------------------------------
+    # Credit / QQQ Hazard
+    # --------------------------------------------------------
+
+    x["hygROC"] = (
+        x["HYG"]
+        .pct_change(
+            CREDIT_ROC_LEN
+        )
+        * 100.0
+    )
+
+    x["lqdROC"] = (
+        x["LQD"]
+        .pct_change(
+            CREDIT_ROC_LEN
+        )
+        * 100.0
+    )
+
+    x["qqqROC"] = (
+        qqq_close
+        .pct_change(
+            QQQ_CRASH_LEN
+        )
+        * 100.0
+    )
+
+    x["vixHazard"] = (
+        x["vixRatio"].notna()
+        &
+        (
+            x["vixRatio"]
+            > VIX_EXTREME
+        )
+    )
+
+    x["creditHazard"] = (
+        USE_CREDIT
+        &
+        x["hygROC"].notna()
+        &
+        x["lqdROC"].notna()
+        &
+        (
+            x["hygROC"] < 0
+        )
+        &
+        (
+            x["lqdROC"] < 0
+        )
+    )
+
+    x["qqqHazard"] = (
+        x["qqqROC"].notna()
+        &
+        (
+            x["qqqROC"]
+            < QQQ_CRASH_PCT
+        )
+    )
+
+    x["hazardCount"] = (
+        x["vixHazard"]
+        .fillna(False)
+        .astype(int)
+        +
+        x["creditHazard"]
+        .fillna(False)
+        .astype(int)
+        +
+        x["qqqHazard"]
+        .fillna(False)
+        .astype(int)
+    )
+
+    x["riskStatus"] = "LOW"
+
+    x.loc[
+        x["hazardCount"] == 1,
+        "riskStatus"
+    ] = "WATCH"
+
+    x.loc[
+        x["hazardCount"] >= 2,
+        "riskStatus"
+    ] = "HIGH"
+
+    # --------------------------------------------------------
+    # Weekly state
+    # --------------------------------------------------------
+
+    x = add_weekly_state_columns(
+        x
+    )
+
+    x["stateWeeklyDown"] = (
+        x["stateWeeklyClose"].notna()
+        &
+        x["stateWeeklyMA5"].notna()
+        &
+        x["stateWeeklyMA20"].notna()
+        &
+        (
+            x["stateWeeklyMA5"]
+            <
+            x["stateWeeklyMA20"]
+        )
+        &
+        (
+            x["stateWeeklyClose"]
+            <
+            x["stateWeeklyMA20"]
+        )
+    )
+
+    x["stateHazardDown"] = (
+        x["hazardCount"] >= 2
+    )
+
+    x["stateAutoDown"] = (
+        x["stateWeeklyDown"]
+        |
+        x["stateHazardDown"]
+    )
+
+    x["stateWeeklyUp"] = (
+        x["stateWeeklyClose"].notna()
+        &
+        x["stateWeeklyMA5"].notna()
+        &
+        x["stateWeeklyMA20"].notna()
+        &
+        (
+            x["stateWeeklyMA5"]
+            >
+            x["stateWeeklyMA20"]
+        )
+        &
+        (
+            x["stateWeeklyClose"]
+            >
+            x["stateWeeklyMA20"]
+        )
+    )
+
+    x["stateBottomCondition"] = (
+        x["qqq_dd"].notna()
+        &
+        (
+            x["qqq_dd"]
+            <= -15.0
+        )
+        &
+        x["stateWeeklyMA5"].notna()
+        &
+        x["stateWeeklyMA5_2W"].notna()
+        &
+        (
+            x["stateWeeklyMA5"]
+            >
+            x["stateWeeklyMA5_2W"]
+        )
+    )
+
+    # --------------------------------------------------------
+    # Auto market state
+    # --------------------------------------------------------
+
+    x["autoMarketState"] = "NONE"
+
+    x.loc[
+        x["stateAutoDown"],
+        "autoMarketState"
+    ] = "DOWN"
+
+    x.loc[
+        (~x["stateAutoDown"])
+        &
+        (
+            x["stateWeeklyUp"]
+            |
+            x["stateBottomCondition"]
+        ),
+        "autoMarketState"
+    ] = "UP/BOTTOM"
+
+    x["autoMarketStateDisplay"] = (
+        x["autoMarketState"]
+        .replace(
+            "NONE",
+            "NEUTRAL"
+        )
+    )
+
+    # --------------------------------------------------------
+    # TP2 automatic mapping
+    # --------------------------------------------------------
+
+    x["tp2Pct"] = (
+        TP2_NONE_PCT
+    )
+
+    x["tp2SellPct"] = (
+        TP2_NONE_SELL_PCT
+    )
+
+    x.loc[
+        x["autoMarketState"]
+        == "DOWN",
+        "tp2Pct"
+    ] = TP2_DOWN_PCT
+
+    x.loc[
+        x["autoMarketState"]
+        == "DOWN",
+        "tp2SellPct"
+    ] = TP2_DOWN_SELL_PCT
+
+    x.loc[
+        x["autoMarketState"]
+        == "UP/BOTTOM",
+        "tp2Pct"
+    ] = TP2_UP_PCT
+
+    x.loc[
+        x["autoMarketState"]
+        == "UP/BOTTOM",
+        "tp2SellPct"
+    ] = TP2_UP_SELL_PCT
+
+    # --------------------------------------------------------
+    # DIP
+    # --------------------------------------------------------
+
+    x["dip1Cond"] = (
+        x["qqq_dd"].notna()
+        &
+        (
+            x["qqq_dd"]
+            <= x["dip1Trigger"]
+        )
+        &
+        (
+            x["qqq_dd"]
+            > MAX_DIP_LIMIT
+        )
+    )
+
+    x["dip2Cond"] = (
+        x["qqq_dd"].notna()
+        &
+        (
+            x["qqq_dd"]
+            <= DIP2_PCT
+        )
+        &
+        (
+            x["qqq_dd"]
+            > MAX_DIP_LIMIT
+        )
+        &
+        x["tqqq_z200"].notna()
+        &
+        (
+            x["tqqq_z200"]
+            <= DIP2_Z200_MAX
+        )
+    )
+
+    x["dip1SignalRaw"] = (
+        x["dip1Cond"]
+        &
+        ~x["dip1Cond"]
+        .shift(1)
+        .fillna(False)
+    )
+
+    x["dip2SignalRaw"] = (
+        x["dip2Cond"]
+        &
+        ~x["dip2Cond"]
+        .shift(1)
+        .fillna(False)
+    )
+
+    return x
+
+
+# ============================================================
+# 5. STATE
 # ============================================================
 
 def default_state():
 
     return {
         "stage": 0,
-
-        "gc_bar": None,
-        "last_full_exit_bar": None,
-
-        "tp1_done": False,
-        "tp2_done": False,
-        "tp3_lock": False,
-
-        "cycle_base_qty": None,
-
-        "pending_action": 0,
-        "pending_bar": None,
-        "pending_position": 0.0,
-        "pending_qty": 0.0,
-
-        "pending_reason": "",
-        "pending_signal_date": None,
-
-        "cash": INITIAL_CAPITAL,
-        "position_qty": 0.0,
-        "avg_price": 0.0,
-
-        "equity_peak": INITIAL_CAPITAL,
-
+        "avgPrice": None,
+        "tp1Fired": False,
+        "tp2Fired": False,
+        "tp3Fired": False,
+        "tp3Lock": False,
         "last_alert_key": "",
         "last_daily_key": "",
         "last_processed_date": "",
@@ -895,20 +1012,22 @@ def load_state():
             encoding="utf-8"
         ) as f:
 
-            s = default_state()
+            state = default_state()
 
-            s.update(
+            state.update(
                 json.load(f)
             )
 
-            return s
+            return state
 
     except Exception:
 
         return default_state()
 
 
-def save_state(state):
+def save_state(
+    state
+):
 
     tmp = STATE_FILE.with_suffix(
         ".tmp"
@@ -932,202 +1051,87 @@ def save_state(state):
 
 
 # ============================================================
-# 5. PORTFOLIO / EXECUTION
+# 6. HELPERS
 # ============================================================
 
-def round_qty(qty):
-
-    return max(
-        0,
-        math.floor(qty)
-    )
-
-
-def mark_equity(
-    state,
-    close
+def fmt(
+    value,
+    digits=2
 ):
 
-    return max(
-        state["cash"]
-        + state["position_qty"] * close,
-        0.0
+    if (
+        value is None
+        or pd.isna(value)
+    ):
+
+        return "-"
+
+    return (
+        f"{float(value):.{digits}f}"
     )
 
 
-def buy_fill(
-    state,
-    qty,
-    price
+def stage_text(
+    stage
 ):
 
-    if qty <= 0:
+    if stage == 0:
+        return "현금 대기"
 
-        return
+    if stage == 1:
+        return "DIP1"
 
-    cost = (
-        qty
-        * price
-    )
+    if stage == 2:
+        return "DIP2"
 
-    fee = (
-        cost
-        * COMMISSION
-    )
-
-    state["cash"] -= (
-        cost
-        + fee
-    )
-
-    old_qty = state["position_qty"]
-    old_avg = state["avg_price"]
-
-    new_qty = (
-        old_qty
-        + qty
-    )
-
-    if new_qty > 0:
-
-        state["avg_price"] = (
-            old_qty * old_avg
-            + qty * price
-        ) / new_qty
-
-    state["position_qty"] = (
-        new_qty
-    )
+    return "GC 보유"
 
 
-def sell_fill(
-    state,
-    qty,
-    price
+def vix_status(
+    ratio
 ):
 
-    qty = min(
-        max(qty, 0),
-        state["position_qty"]
-    )
+    if (
+        ratio is None
+        or pd.isna(ratio)
+    ):
 
-    if qty <= 0:
+        return "N/A"
 
-        return
+    if ratio > VIX_EXTREME:
+        return "EXTREME"
 
-    proceeds = (
-        qty
-        * price
-    )
+    if ratio > VIX_NORMAL:
+        return "RISK"
 
-    fee = (
-        proceeds
-        * COMMISSION
-    )
-
-    state["cash"] += (
-        proceeds
-        - fee
-    )
-
-    state["position_qty"] -= (
-        qty
-    )
-
-    if state["position_qty"] <= 0:
-
-        state["position_qty"] = 0.0
-        state["avg_price"] = 0.0
+    return "NORMAL"
 
 
 # ============================================================
-# TradingView Sync BUY Sizing
+# 7. PINE STATE REPLAY
 # ============================================================
 
-def buy_qty(
-    state,
-    signal_close,
-    equity_now,
-    target_value
-):
-
-    current_position_value = (
-        max(
-            state["position_qty"],
-            0
-        )
-        * signal_close
-    )
-
-    available_cash = (
-        max(
-            equity_now
-            - current_position_value,
-            0
-        )
-        * (
-            1
-            - CASH_BUFFER / 100
-        )
-    )
-
-    estimated_fill = (
-        signal_close
-        + MIN_TICK
-    )
-
-    target_qty = (
-        max(
-            target_value
-            - current_position_value,
-            0
-        )
-        / estimated_fill
-    )
-
-    cash_qty = (
-        available_cash
-        / (
-            estimated_fill
-            * 1.0005
-        )
-    )
-
-    return round_qty(
-        min(
-            target_qty,
-            cash_qty
-        )
-    )
-
-
-# ============================================================
-# 6. SIGNAL / REPLAY ENGINE
-# ============================================================
-
-def replay(
-    df,
-    state,
-    send_alerts=False
+def replay_pine_signals(
+    df: pd.DataFrame,
+    start_date: str
 ):
 
     """
-    2010-02-11부터 최근 거래일까지 일봉 재생.
+    현재 Pine 코드의 일봉 처리 순서 그대로 재생.
 
-    신호 발생일:
-        종가에서 BUY 수량 계산
-        ↓
-        pending_qty 저장
-
-    다음 거래일:
-        OPEN
-        ↓
-        pending_qty 그대로 체결
+    중요:
+      - TP/신호 조건은 액션 mutation 전 state를 사용
+      - 액션 후 Stage / avgPrice / TP flags 변경
+      - Pine의 one-bar-one-action 우선순위 동일
     """
+
+    state = default_state()
+
+    events = []
 
     dates = df.index[
         df.index >= pd.Timestamp(
-            START_DATE
+            start_date
         )
     ]
 
@@ -1137,819 +1141,435 @@ def replay(
             "START_DATE 이후 데이터가 없습니다."
         )
 
-    gc_bar_index = None
-    last_full_exit_idx = None
+    manual_avg = (
+        MY_AVG_PRICE > 0.0
+    )
 
-    # --------------------------------------------------------
-    # 상태 reset
-    # --------------------------------------------------------
+    display_avg = None
 
-    state["gc_bar"] = None
-    state["last_full_exit_bar"] = None
+    prev_dip1_cond = False
+    prev_dip2_cond = False
 
-    state["pending_action"] = 0
-    state["pending_bar"] = None
-    state["pending_position"] = 0.0
-    state["pending_qty"] = 0.0
-
-    state["pending_reason"] = ""
-    state["pending_signal_date"] = None
-
-    state["stage"] = 0
-
-    state["tp1_done"] = False
-    state["tp2_done"] = False
-    state["tp3_lock"] = False
-
-    state["cycle_base_qty"] = None
-
-    state["cash"] = INITIAL_CAPITAL
-    state["position_qty"] = 0.0
-    state["avg_price"] = 0.0
-
-    state["equity_peak"] = INITIAL_CAPITAL
-
-    state["last_full_exit_bar"] = None
-    state["gc_bar"] = None
-
-    new_alerts = []
-
-    for i, dt in enumerate(dates):
+    for dt in dates:
 
         row = df.loc[dt]
 
-        close = (
-            float(
-                row["TQQQ_CLOSE"]
-            )
-            if pd.notna(
-                row["TQQQ_CLOSE"]
-            )
-            else None
-        )
+        close = row[
+            "TQQQ_Close"
+        ]
 
-        open_ = (
-            float(
-                row["TQQQ_OPEN"]
-            )
-            if pd.notna(
-                row["TQQQ_OPEN"]
-            )
-            else None
-        )
-
-        if close is None or open_ is None:
-
+        if pd.isna(close):
             continue
 
-        # ====================================================
-        # A. 전일 Signal -> 오늘 OPEN 체결
-        # ====================================================
+        close = float(close)
 
-        if (
-            state["pending_action"] != 0
-            and state["pending_bar"] == i - 1
-        ):
+        # ----------------------------------------------------
+        # Pine displayAvg
+        # ----------------------------------------------------
 
-            action = (
-                state["pending_action"]
+        if manual_avg:
+
+            display_avg = (
+                MY_AVG_PRICE
             )
-
-            reason = (
-                state["pending_reason"]
-            )
-
-            # ------------------------------------------------
-            # TradingView:
-            #
-            # process_orders_on_close=false
-            # → 신호 다음 봉 OPEN 체결
-            #
-            # 평균단가에는 ±1 tick 추가하지 않는다.
-            # ------------------------------------------------
-
-            fill_price = open_
-
-            # ------------------------------------------------
-            # DIP1
-            # ------------------------------------------------
-            if action == 1:
-
-                qty = round_qty(
-                    state.get(
-                        "pending_qty",
-                        0.0
-                    )
-                )
-
-                if qty >= 1:
-
-                    buy_fill(
-                        state,
-                        qty,
-                        fill_price
-                    )
-
-                state["stage"] = 1
-
-                state["cycle_base_qty"] = (
-                    state["position_qty"]
-                )
-
-                state["tp3_lock"] = False
-
-            # ------------------------------------------------
-            # DIP2
-            # ------------------------------------------------
-            elif action == 2:
-
-                qty = round_qty(
-                    state.get(
-                        "pending_qty",
-                        0.0
-                    )
-                )
-
-                if qty >= 1:
-
-                    buy_fill(
-                        state,
-                        qty,
-                        fill_price
-                    )
-
-                state["stage"] = 2
-
-                if (
-                    state["cycle_base_qty"]
-                    is None
-                ):
-
-                    state["cycle_base_qty"] = (
-                        state["position_qty"]
-                    )
-
-            # ------------------------------------------------
-            # GC
-            # ------------------------------------------------
-            elif action == 3:
-
-                qty = round_qty(
-                    state.get(
-                        "pending_qty",
-                        0.0
-                    )
-                )
-
-                if qty >= 1:
-
-                    buy_fill(
-                        state,
-                        qty,
-                        fill_price
-                    )
-
-                state["stage"] = 3
-
-                state["cycle_base_qty"] = (
-                    state["position_qty"]
-                )
-
-                state["gc_bar"] = None
-                state["tp3_lock"] = False
-
-            # ------------------------------------------------
-            # TP1
-            # ------------------------------------------------
-            elif action == -1:
-
-                qty = round_qty(
-                    state["position_qty"]
-                    * TP1_SELL_PCT
-                    / 100
-                )
-
-                sell_fill(
-                    state,
-                    qty,
-                    fill_price
-                )
-
-                state["tp1_done"] = True
-
-            # ------------------------------------------------
-            # TP2
-            # ------------------------------------------------
-            elif action == -2:
-
-                sell_pct = float(
-                    state.get(
-                        "_pending_tp2_sell",
-                        TP2_NONE_SELL
-                    )
-                )
-
-                base = float(
-                    state["cycle_base_qty"]
-                    or 0
-                )
-
-                qty = round_qty(
-                    min(
-                        base
-                        * sell_pct
-                        / 100,
-                        state["position_qty"]
-                    )
-                )
-
-                sell_fill(
-                    state,
-                    qty,
-                    fill_price
-                )
-
-                state["tp2_done"] = True
-
-            # ------------------------------------------------
-            # DC
-            # ------------------------------------------------
-            elif action == -3:
-
-                sell_fill(
-                    state,
-                    state["position_qty"],
-                    fill_price
-                )
-
-                state["stage"] = 0
-
-                state["tp1_done"] = False
-                state["tp2_done"] = False
-
-                state["cycle_base_qty"] = None
-
-                state["gc_bar"] = None
-
-                state["last_full_exit_bar"] = i
-
-            # ------------------------------------------------
-            # TP3
-            # ------------------------------------------------
-            elif action == -4:
-
-                sell_fill(
-                    state,
-                    state["position_qty"],
-                    fill_price
-                )
-
-                state["stage"] = 0
-
-                state["tp1_done"] = False
-                state["tp2_done"] = False
-
-                state["cycle_base_qty"] = None
-
-                state["gc_bar"] = None
-
-                state["last_full_exit_bar"] = i
-
-                state["tp3_lock"] = True
-
-            if send_alerts:
-
-                new_alerts.append(
-                    (
-                        "FILL",
-                        dt,
-                        reason,
-                        fill_price,
-                        state["position_qty"]
-                    )
-                )
-
-            # ------------------------------------------------
-            # pending reset
-            # ------------------------------------------------
-
-            state["pending_action"] = 0
-            state["pending_bar"] = None
-            state["pending_position"] = 0.0
-            state["pending_qty"] = 0.0
-            state["pending_reason"] = ""
-            state["pending_signal_date"] = None
-
-            state.pop(
-                "_pending_eq_factor",
-                None
-            )
-
-            state.pop(
-                "_pending_tp2_sell",
-                None
-            )
-
-        # ====================================================
-        # B. 현재 종가 기준 Equity / EQDD
-        # ====================================================
-
-        equity = mark_equity(
-            state,
-            close
-        )
-
-        state["equity_peak"] = max(
-            state["equity_peak"],
-            equity
-        )
-
-        eq_dd = (
-            (
-                equity
-                / state["equity_peak"]
-                - 1
-            )
-            * 100
-            if state["equity_peak"] > 0
-            else 0
-        )
-
-        if eq_dd >= -EQ_START:
-
-            eq_factor = 1.0
-
-        elif eq_dd <= -EQ_FULL:
-
-            eq_factor = EQ_MIN
 
         else:
 
-            eq_factor = 1 - (
-                (1 - EQ_MIN)
-                * (
-                    (
-                        -eq_dd
-                        - EQ_START
-                    )
-                    / (
-                        EQ_FULL
-                        - EQ_START
-                    )
-                )
+            display_avg = (
+                state["avgPrice"]
             )
 
-        if not USE_EQDD:
+        # ----------------------------------------------------
+        # Pine TP prices
+        # mutation 전 상태
+        # ----------------------------------------------------
 
-            eq_factor = 1.0
-
-        eq_factor = max(
-            EQ_MIN,
-            min(
-                1.0,
-                eq_factor
+        tp1_price = (
+            display_avg
+            * (
+                1.0
+                + TP1_PCT / 100.0
             )
+            if display_avg is not None
+            else None
         )
 
-        # ====================================================
-        # C. GC memory
-        # ====================================================
+        current_tp2_pct = float(
+            row["tp2Pct"]
+        )
 
-        # TradingView와 동일하게 최초 GC만 memory에 저장
-        if bool(
-            row["gc_confirmed"]
+        current_tp2_sell_pct = float(
+            row["tp2SellPct"]
+        )
+
+        tp2_price = (
+            display_avg
+            * (
+                1.0
+                + current_tp2_pct / 100.0
+            )
+            if display_avg is not None
+            else None
+        )
+
+        tp3_price = (
+            display_avg
+            * (
+                1.0
+                + TP3_PCT / 100.0
+            )
+            if display_avg is not None
+            else None
+        )
+
+        # ----------------------------------------------------
+        # position
+        # ----------------------------------------------------
+
+        in_position = (
+            state["stage"] >= 1
+            or manual_avg
+        )
+
+        # ----------------------------------------------------
+        # TP
+        # ----------------------------------------------------
+
+        tp1_hit = (
+            in_position
+            and not state["tp1Fired"]
+            and tp1_price is not None
+            and close >= tp1_price
+        )
+
+        tp2_hit = (
+            in_position
+            and state["tp1Fired"]
+            and not state["tp2Fired"]
+            and tp2_price is not None
+            and close >= tp2_price
+        )
+
+        tp3_hit = (
+            in_position
+            and not state["tp3Fired"]
+            and not state["tp3Lock"]
+            and tp3_price is not None
+            and close >= tp3_price
+        )
+
+        # ----------------------------------------------------
+        # DIP conditions
+        # ----------------------------------------------------
+
+        dip1_cond = (
+            bool(row["dip1Cond"])
+            if pd.notna(row["dip1Cond"])
+            else False
+        )
+
+        dip2_cond = (
+            bool(row["dip2Cond"])
+            if pd.notna(row["dip2Cond"])
+            else False
+        )
+
+        dip1_signal = (
+            state["stage"] == 0
+            and dip1_cond
+            and not prev_dip1_cond
+        )
+
+        dip2_signal = (
+            state["stage"] == 1
+            and dip2_cond
+            and not prev_dip2_cond
+        )
+
+        prev_dip1_cond = (
+            dip1_cond
+        )
+
+        prev_dip2_cond = (
+            dip2_cond
+        )
+
+        # ----------------------------------------------------
+        # Pine one-bar-one-action
+        # ----------------------------------------------------
+
+        action = ""
+
+        if (
+            bool(row["deadCross"])
+            and state["stage"] > 0
         ):
 
-            if gc_bar_index is None:
+            action = "DC"
 
-                gc_bar_index = i
-                state["gc_bar"] = i
+        elif tp3_hit:
 
-        gc_eligible = (
-            gc_bar_index is not None
-            and i - gc_bar_index >= GC_DELAY
-            and bool(
-                row["t_fast"]
-                > row["t_slow"]
-            )
-            and bool(
-                row["gc_band"]
-            )
-        )
+            action = "TP3"
 
-        can_buy_after_exit = (
-            last_full_exit_idx is None
-            or i - last_full_exit_idx
-            > COOLDOWN_DAYS
-        )
+        elif tp1_hit:
 
-        # ----------------------------------------------------
-        # 필수 데이터 준비 여부
-        # ----------------------------------------------------
+            action = "TP1"
 
-        ready = all(
-            pd.notna(
-                row.get(c)
-            )
-            for c in [
-                "q_dd",
-                "q_filter",
-                "t_fast",
-                "t_slow",
-                "vix_ratio",
-                "credit_roc"
-            ]
-        )
+        elif tp2_hit:
 
-        if not ready:
+            action = "TP2"
 
-            continue
+        elif (
+            bool(row["goldCross"])
+            and state["stage"] < 3
+            and not state["tp3Lock"]
+            and float(row["qqq_dd"])
+            > MAX_DIP_LIMIT
+        ):
 
-        max_dip_reached = (
-            float(row["q_dd"])
-            <= -MAX_DIP
-        )
+            action = "GC"
 
-        has_position = (
-            state["position_qty"] > 0
-        )
+        elif dip1_signal:
 
-        # ====================================================
-        # D. Order priority
-        #
-        # DC -> TP3 -> TP1 -> TP2 -> BUY
-        # ====================================================
+            action = "DIP1"
 
-        signal = None
-        reason = None
+        elif dip2_signal:
+
+            action = "DIP2"
 
         # ----------------------------------------------------
-        # DC
+        # state before mutation
         # ----------------------------------------------------
 
-        dc_condition = (
-            has_position
-            and bool(
-                row["dc_confirmed"]
-            )
-        )
+        pre_stage = state[
+            "stage"
+        ]
+
+        pre_avg = state[
+            "avgPrice"
+        ]
 
         # ----------------------------------------------------
-        # TP3
+        # Pine mutation
         # ----------------------------------------------------
 
-        tp3_condition = (
-            has_position
-            and not state["tp3_lock"]
-            and state["cycle_base_qty"]
-            is not None
-            and state["avg_price"] > 0
-            and close
-            >= state["avg_price"]
-            * (
-                1
-                + TP3_PCT / 100
-            )
-        )
+        if action == "DC":
 
-        # ----------------------------------------------------
-        # TP1
-        # ----------------------------------------------------
+            state["stage"] = 0
+            state["avgPrice"] = None
+            state["tp1Fired"] = False
+            state["tp2Fired"] = False
+            state["tp3Fired"] = False
+            state["tp3Lock"] = False
 
-        tp1_condition = (
-            has_position
-            and not state["tp1_done"]
-            and state["avg_price"] > 0
-            and close
-            >= state["avg_price"]
-            * (
-                1
-                + TP1_PCT / 100
-            )
-            and round_qty(
-                state["position_qty"]
-                * TP1_SELL_PCT
-                / 100
-            ) >= 1
-        )
+        elif action == "TP3":
 
-        # ----------------------------------------------------
-        # TP2
-        # ----------------------------------------------------
+            state["stage"] = 0
+            state["avgPrice"] = None
+            state["tp1Fired"] = False
+            state["tp2Fired"] = False
+            state["tp3Fired"] = True
+            state["tp3Lock"] = True
 
-        tp2_trigger = float(
-            row["tp2_trigger"]
-        )
+        elif action == "TP1":
 
-        tp2_sell_pct = float(
-            row["tp2_sell_pct"]
-        )
+            state["tp1Fired"] = True
 
-        tp2_qty = round_qty(
-            min(
-                float(
-                    state["cycle_base_qty"]
-                    or 0
-                )
-                * tp2_sell_pct
-                / 100,
-                state["position_qty"]
-            )
-        )
+        elif action == "TP2":
 
-        tp2_condition = (
-            has_position
-            and state["tp1_done"]
-            and not state["tp2_done"]
-            and state["avg_price"] > 0
-            and close
-            >= state["avg_price"]
-            * (
-                1
-                + tp2_trigger / 100
-            )
-            and tp2_qty >= 1
-        )
+            state["tp2Fired"] = True
 
-        # ----------------------------------------------------
-        # BUY allowed
-        # ----------------------------------------------------
+        elif action == "GC":
 
-        buy_allowed = (
-            can_buy_after_exit
-            and not max_dip_reached
-        )
+            if state["stage"] == 0:
 
-        # ----------------------------------------------------
-        # DIP1
-        # ----------------------------------------------------
+                state["avgPrice"] = close
+                state["stage"] = 3
 
-        dip1_condition = (
-            buy_allowed
-            and state["stage"] == 0
-            and not has_position
-            and float(row["q_dd"])
-            <= -float(
-                row["dip1_threshold"]
-            )
-        )
+                state["tp1Fired"] = False
+                state["tp2Fired"] = False
+                state["tp3Fired"] = False
+                state["tp3Lock"] = False
 
-        # ----------------------------------------------------
-        # DIP2
-        # ----------------------------------------------------
+            elif state["stage"] == 1:
 
-        dip2_condition = (
-            buy_allowed
-            and state["stage"] == 1
-            and has_position
-            and float(row["q_dd"])
-            <= -DIP2
-            and float(row["QQQ"])
-            <= float(
-                row["q_filter"]
-            )
-            * (
-                1
-                + DIP2_FILTER_PCT
-                / 100
-            )
-            and bool(
-                row["credit_ok"]
-            )
-        )
-
-        # ----------------------------------------------------
-        # GC
-        # ----------------------------------------------------
-
-        gc_condition = (
-            buy_allowed
-            and gc_eligible
-            and not state["tp3_lock"]
-        )
-
-        # ====================================================
-        # Signal priority
-        # ====================================================
-
-        if dc_condition:
-
-            signal, reason = -3, "DC"
-
-            # TradingView:
-            # DC 주문 발생 시 gcBar := na
-            gc_bar_index = None
-            state["gc_bar"] = None
-
-        elif tp3_condition:
-
-            signal, reason = -4, "TP3"
-
-        elif tp1_condition:
-
-            signal, reason = -1, "TP1"
-
-        elif tp2_condition:
-
-            signal, reason = (
-                -2,
-                f"TP2 {row['tp2_state']}"
-            )
-
-        elif gc_condition:
-
-            signal, reason = 3, "GC"
-
-        elif dip1_condition:
-
-            signal, reason = 1, "DIP1"
-
-        elif dip2_condition:
-
-            signal, reason = 2, "DIP2"
-
-        # ====================================================
-        # E. Signal -> Pending
-        # ====================================================
-
-        if signal is not None:
-
-            # ------------------------------------------------
-            # TradingView SIZING:
-            # 신호일 종가에서 주문수량 확정
-            # ------------------------------------------------
-
-            dip1_target_value = (
-                equity
-                * min(
-                    DIP1_WEIGHT
-                    + float(
-                        row["rsi_bonus"]
-                    ),
-                    100
-                )
-                / 100
-            )
-
-            dip2_target_value = (
-                equity
-                * min(
-                    DIP2_WEIGHT
-                    * eq_factor
-                    + float(
-                        row["rsi_bonus"]
-                    ),
-                    100
-                )
-                / 100
-            )
-
-            gc_target_value = (
-                equity
-                * SAFETY_FACTOR
-                / 100
-            )
-
-            pending_qty = 0.0
-
-            if signal > 0:
-
-                if signal == 1:
-
-                    target_value = (
-                        dip1_target_value
-                    )
-
-                elif signal == 2:
-
-                    target_value = (
-                        dip2_target_value
-                    )
-
-                else:
-
-                    target_value = (
-                        gc_target_value
-                    )
-
-                pending_qty = buy_qty(
-                    state=state,
-                    signal_close=close,
-                    equity_now=equity,
-                    target_value=target_value,
-                )
-
-            # ------------------------------------------------
-            # pending 저장
-            # ------------------------------------------------
-
-            state["pending_action"] = signal
-
-            state["pending_bar"] = i
-
-            state["pending_position"] = (
-                state["position_qty"]
-            )
-
-            state["pending_qty"] = (
-                pending_qty
-            )
-
-            state["pending_reason"] = reason
-
-            state["pending_signal_date"] = (
-                dt.strftime("%Y-%m-%d")
-            )
-
-            if signal == 2:
-
-                state["_pending_eq_factor"] = (
-                    eq_factor
-                )
-
-            if signal == -2:
-
-                state["_pending_tp2_sell"] = (
-                    tp2_sell_pct
-                )
-
-            if send_alerts:
-
-                new_alerts.append(
+                state["avgPrice"] = (
                     (
-                        "SIGNAL",
-                        dt,
-                        reason,
-                        close,
-                        {
-                            "qdd": float(
-                                row["q_dd"]
-                            ),
-                            "vixratio": float(
-                                row["vix_ratio"]
-                            ),
-                            "eqdd": float(
-                                eq_dd
-                            ),
-                            "eqfactor": float(
-                                eq_factor
-                            ),
-                            "stage": int(
-                                state["stage"]
-                            ),
-                            "tp2state": str(
-                                row["tp2_state"]
-                            ),
-                            "tp2trigger": (
-                                tp2_trigger
-                            ),
-                            "tp2sell": (
-                                tp2_sell_pct
-                            ),
-                        }
+                        state["avgPrice"]
+                        + close
                     )
+                    / 2.0
+                    if state["avgPrice"]
+                    is not None
+                    else close
                 )
 
-        state["last_processed_date"] = (
-            dt.strftime("%Y-%m-%d")
-        )
+                state["stage"] = 3
 
-    return state, new_alerts
+                # TP state preserved
+
+            elif state["stage"] == 2:
+
+                state["avgPrice"] = (
+                    state["avgPrice"] * 0.7
+                    + close * 0.3
+                    if state["avgPrice"]
+                    is not None
+                    else close
+                )
+
+                state["stage"] = 3
+
+                # TP state preserved
+
+        elif action == "DIP1":
+
+            state["tp3Lock"] = False
+
+            if state["stage"] == 0:
+
+                state["avgPrice"] = close
+                state["stage"] = 1
+
+                state["tp1Fired"] = False
+                state["tp2Fired"] = False
+                state["tp3Fired"] = False
+
+        elif action == "DIP2":
+
+            if state["stage"] == 1:
+
+                state["avgPrice"] = (
+                    (
+                        state["avgPrice"]
+                        * 0.3
+                        + close * 0.4
+                    )
+                    / 0.7
+                    if state["avgPrice"]
+                    is not None
+                    else close
+                )
+
+                state["stage"] = 2
+
+        # ----------------------------------------------------
+        # Event record
+        # ----------------------------------------------------
+
+        if action:
+
+            events.append(
+                {
+                    "date": dt,
+                    "action": action,
+                    "close": close,
+
+                    "pre_stage": pre_stage,
+                    "post_stage": state["stage"],
+
+                    "pre_avg": pre_avg,
+                    "post_avg": state["avgPrice"],
+
+                    "autoMarketState":
+                        str(
+                            row[
+                                "autoMarketState"
+                            ]
+                        ),
+
+                    "autoMarketStateDisplay":
+                        str(
+                            row[
+                                "autoMarketStateDisplay"
+                            ]
+                        ),
+
+                    "tp2Pct":
+                        current_tp2_pct,
+
+                    "tp2SellPct":
+                        current_tp2_sell_pct,
+
+                    "qqq_dd":
+                        float(
+                            row["qqq_dd"]
+                        )
+                        if pd.notna(
+                            row["qqq_dd"]
+                        )
+                        else None,
+
+                    "tqqq_z200":
+                        float(
+                            row["tqqq_z200"]
+                        )
+                        if pd.notna(
+                            row["tqqq_z200"]
+                        )
+                        else None,
+
+                    "vixRatio":
+                        float(
+                            row["vixRatio"]
+                        )
+                        if pd.notna(
+                            row["vixRatio"]
+                        )
+                        else None,
+
+                    "riskStatus":
+                        str(
+                            row[
+                                "riskStatus"
+                            ]
+                        ),
+
+                    "dip1Trigger":
+                        float(
+                            row[
+                                "dip1Trigger"
+                            ]
+                        ),
+
+                    "gc_gap":
+                        float(
+                            row["gc_gap"]
+                        )
+                        if pd.notna(
+                            row["gc_gap"]
+                        )
+                        else None,
+                }
+            )
+
+    state["last_processed_date"] = (
+        dates[-1]
+        .strftime("%Y-%m-%d")
+    )
+
+    return state, events
 
 
 # ============================================================
-# 7. TELEGRAM MESSAGE
+# 8. TELEGRAM MESSAGE
 # ============================================================
-
-def fmt(
-    v,
-    n=2
-):
-
-    try:
-
-        return f"{float(v):.{n}f}"
-
-    except Exception:
-
-        return "-"
-
 
 def build_signal_message(
-    dt,
-    reason,
-    close,
-    meta,
-    row
+    event
 ):
+
+    action = event[
+        "action"
+    ]
 
     direction = (
         "🟢 매수 신호"
-        if reason
+        if action
         in (
+            "GC",
             "DIP1",
-            "DIP2",
-            "GC"
+            "DIP2"
         )
         else
         "🔴 매도 신호"
@@ -1957,528 +1577,446 @@ def build_signal_message(
 
     lines = [
 
-        "❄️ <b>눈덩이 TQQQ · ULTIMATE v2.0</b>",
+        "❄️ <b>눈덩이 TQQQ · ULTIMATE TV MATCH</b>",
+
         "",
+
         f"<b>{direction}</b>",
-        f"신호: <b>{html.escape(str(reason))}</b>",
-        f"신호일: {dt.strftime('%Y-%m-%d')}",
-        f"TQQQ 종가: <b>{fmt(close)}</b>",
+
+        f"신호: <b>{html.escape(action)}</b>",
+
+        f"신호일: "
+        f"{event['date'].strftime('%Y-%m-%d')}",
+
+        f"TQQQ 종가: "
+        f"<b>{fmt(event['close'])}</b>",
+
         "",
-        f"QQQ DD: {fmt(meta['qdd'])}%",
-        f"VIX/VIX3M: {fmt(meta['vixratio'], 3)}",
-        f"EQDD: {fmt(meta['eqdd'])}%",
-        f"EQDD 계수: {fmt(meta['eqfactor'], 3)}",
-        f"현재 Stage: {meta['stage']}",
+
+        "자동 시장상태: "
+        f"<b>{html.escape(event['autoMarketStateDisplay'])}</b>",
+
+        f"TP2 기준: "
+        f"+{fmt(event['tp2Pct'], 0)}% / "
+        f"{fmt(event['tp2SellPct'], 0)}%",
+
+        f"QQQ DD: "
+        f"{fmt(event['qqq_dd'])}%",
+
+        f"TQQQ Z200: "
+        f"{fmt(event['tqqq_z200'])}%",
+
+        f"VIX Ratio: "
+        f"{fmt(event['vixRatio'], 2)} · "
+        f"{html.escape(vix_status(event['vixRatio']))}",
+
+        f"Risk: "
+        f"{html.escape(event['riskStatus'])}",
+
+        f"Stage: "
+        f"{stage_text(event['post_stage'])}",
     ]
 
-    if reason == "DIP1":
+    if action == "DIP1":
 
         lines += [
+
             "",
-            f"DIP1 기준: -{fmt(row['dip1_threshold'])}%",
-            "목표 비중: 30%",
-            "➡️ 다음 정규장 시가 기준 매수",
+
+            f"DIP1 기준: "
+            f"{fmt(event['dip1Trigger'])}%",
+
+            "TQQQ 30%",
         ]
 
-    elif reason == "DIP2":
+    elif action == "DIP2":
 
         lines += [
+
             "",
-            "DIP2 기준: -22%",
-            f"TP2 상태: {html.escape(str(meta['tp2state']))}",
-            "목표 비중: EQDD 반영 최대 70%",
-            "➡️ 다음 정규장 시가 기준 추가매수",
+
+            f"DIP2 QQQ DD: "
+            f"{fmt(DIP2_PCT, 0)}%",
+
+            f"TQQQ Z200: "
+            f"{fmt(DIP2_Z200_MAX, 0)}% 이하",
+
+            "TQQQ 70%",
         ]
 
-    elif reason == "GC":
+    elif action == "GC":
 
         lines += [
+
             "",
-            "TQQQ SMA 5/220 GC",
-            "GC Band: +2.90%",
-            "목표 비중: 99%",
-            "➡️ 다음 정규장 시가 기준 매수",
+
+            f"GC Gap: "
+            f"{fmt(event['gc_gap'] * 100 if event['gc_gap'] is not None else None)}%",
+
+            f"GC 기준: "
+            f"+{GC_PCT:.2f}%",
+
+            "TQQQ 100%",
         ]
 
-    elif reason == "TP1":
+    elif action == "TP1":
 
         lines += [
+
             "",
-            "TP1: +15%",
-            "현재 보유수량의 50% 매도",
-            "➡️ 다음 정규장 시가 기준 매도",
+
+            f"TP1: "
+            f"+{TP1_PCT:.0f}%",
+
+            f"매도: "
+            f"{TP1_SELL_PCT}%",
         ]
 
-    elif reason.startswith("TP2"):
+    elif action == "TP2":
 
         lines += [
+
             "",
-            f"TP2 상태: {html.escape(str(meta['tp2state']))}",
-            f"TP2 기준: +{fmt(meta['tp2trigger'])}%",
-            f"기준수량 매도: {fmt(meta['tp2sell'])}%",
-            "➡️ 다음 정규장 시가 기준 매도",
+
+            f"TP2 상태: "
+            f"{html.escape(event['autoMarketStateDisplay'])}",
+
+            f"TP2: "
+            f"+{event['tp2Pct']:.0f}%",
+
+            f"기준수량 매도: "
+            f"{event['tp2SellPct']:.0f}%",
         ]
 
-    elif reason == "TP3":
+    elif action == "TP3":
 
         lines += [
+
             "",
-            "TP3: +350%",
-            "잔여 전량 매도",
-            "TP3 Lock 발동",
-            "➡️ 다음 정규장 시가 기준 매도",
+
+            f"TP3: "
+            f"+{TP3_PCT:.0f}%",
+
+            "전량 매도 / Lock ON",
         ]
 
-    elif reason == "DC":
+    elif action == "DC":
 
         lines += [
+
             "",
-            "DC Band: -0.10%",
+
+            f"DC 기준: "
+            f"{DC_PCT:.2f}%",
+
             "전량 매도",
-            "➡️ 다음 정규장 시가 기준 매도",
         ]
+
+    lines += [
+
+        "",
+
+        "📌 TradingView Pine MATCH 신호",
+
+        "➡️ 신호 발생일 종가 확정 기준",
+    ]
 
     return "\n".join(lines)
 
 
 # ============================================================
-# 7-1. DAILY STATUS MESSAGE
+# 8-1. DAILY STATUS
 # ============================================================
 
 def build_daily_status_message(
-    dt,
+    df,
     state,
-    row,
-    signal_today=None,
-    prev_close=None,
-    nq_price=None,
-    nq_change_pct=None
+    last_date,
+    today_event
 ):
 
+    row = df.loc[
+        last_date
+    ]
+
     close = float(
-        row["TQQQ_CLOSE"]
+        row["TQQQ_Close"]
     )
 
-    # ========================================================
-    # TQQQ 전일 대비
-    # ========================================================
+    prev_dates = (
+        df.index[
+            df.index < last_date
+        ]
+    )
 
-    if (
-        prev_close is not None
-        and prev_close > 0
-    ):
+    prev_close = (
 
-        chg_pct = (
+        float(
+            df.loc[
+                prev_dates[-1],
+                "TQQQ_Close"
+            ]
+        )
+
+        if len(prev_dates)
+
+        else None
+    )
+
+    change_pct = (
+
+        (
             close
             / prev_close
             - 1.0
-        ) * 100.0
+        )
+        * 100.0
 
-    else:
-
-        chg_pct = float("nan")
-
-    # ========================================================
-    # 현재 시장상태
-    #
-    # Python Ultimate 자동 종합 상태
-    # ========================================================
-
-    if bool(
-        row["down_state"]
-    ):
-
-        market_state = "DOWN"
-
-    elif bool(
-        row["up_state"]
-    ):
-
-        market_state = "UP/BOTTOM"
-
-    else:
-
-        market_state = "NONE"
-
-    # ========================================================
-    # 오늘 행동지침
-    # ========================================================
-
-    if signal_today:
-
-        # ----------------------------------------------------
-        # DIP1
-        # ----------------------------------------------------
-
-        if signal_today == "DIP1":
-
-            action_text = (
-                "🟢 DIP1 매수\n"
-                "➡️ 다음 정규장 시가 기준 목표비중 30%"
-            )
-
-        # ----------------------------------------------------
-        # DIP2
-        # ----------------------------------------------------
-
-        elif signal_today == "DIP2":
-
-            action_text = (
-                "🟢 DIP2 추가매수\n"
-                "➡️ 다음 정규장 시가 기준 "
-                "EQDD 반영 최대 70%"
-            )
-
-        # ----------------------------------------------------
-        # GC
-        # ----------------------------------------------------
-
-        elif signal_today == "GC":
-
-            action_text = (
-                "🟢 GC 매수\n"
-                "➡️ 다음 정규장 시가 기준 목표비중 99%"
-            )
-
-        # ----------------------------------------------------
-        # TP1
-        # ----------------------------------------------------
-
-        elif signal_today == "TP1":
-
-            action_text = (
-                "🔴 TP1 매도\n"
-                "➡️ 다음 정규장 시가 기준 보유수량 50% 매도"
-            )
-
-        # ----------------------------------------------------
-        # TP2
-        # ----------------------------------------------------
-
-        elif signal_today.startswith("TP2"):
-
-            tp2_state = str(
-                row["tp2_state"]
-            )
-
-            tp2_sell_pct = float(
-                row["tp2_sell_pct"]
-            )
-
-            tp2_trigger = float(
-                row["tp2_trigger"]
-            )
-
-            action_text = (
-                f"🔴 TP2 {tp2_state} 매도\n"
-                f"➡️ 다음 정규장 시가 기준 "
-                f"기준수량 {tp2_sell_pct:.0f}% 매도"
-                f" (TP2 +{tp2_trigger:.0f}%)"
-            )
-
-        # ----------------------------------------------------
-        # TP3
-        # ----------------------------------------------------
-
-        elif signal_today == "TP3":
-
-            action_text = (
-                "🔴 TP3 전량매도\n"
-                "➡️ 다음 정규장 시가 기준 "
-                "잔여 전량 매도 · Lock ON"
-            )
-
-        # ----------------------------------------------------
-        # DC
-        # ----------------------------------------------------
-
-        elif signal_today == "DC":
-
-            action_text = (
-                "🔴 DC 전량매도\n"
-                "➡️ 다음 정규장 시가 기준 전량 매도"
-            )
-
-        else:
-
-            action_text = (
-                f"🚨 {html.escape(str(signal_today))}\n"
-                "➡️ 다음 정규장 시가 기준 실행"
-            )
-
-    else:
-
-        # ----------------------------------------------------
-        # 신호 없는 날
-        # ----------------------------------------------------
-
-        stage = int(
-            state.get(
-                "stage",
-                0
-            )
+        if (
+            prev_close is not None
+            and prev_close > 0
         )
 
-        if state.get(
-            "tp3_lock",
-            False
-        ):
-
-            action_text = (
-                "⏸️ 매매 없음\n"
-                "➡️ TP3 Lock 유지 · 다음 매수신호 대기"
-            )
-
-        elif stage == 0:
-
-            action_text = (
-                "⏸️ 매매 없음\n"
-                "➡️ 신규 매수신호 대기"
-            )
-
-        elif stage == 1:
-
-            action_text = (
-                "⏸️ 매매 없음\n"
-                "➡️ 기존 포지션 유지 · "
-                "추가매수/익절 신호 대기"
-            )
-
-        elif stage == 2:
-
-            action_text = (
-                "⏸️ 매매 없음\n"
-                "➡️ 기존 포지션 유지 · "
-                "익절/GC/DC 신호 대기"
-            )
-
-        else:
-
-            action_text = (
-                "⏸️ 매매 없음\n"
-                "➡️ 기존 포지션 유지 · "
-                "익절/DC 신호 대기"
-            )
-
-    # ========================================================
-    # 등락률
-    # ========================================================
+        else None
+    )
 
     change_text = (
-        f"{chg_pct:+.2f}%"
-        if pd.notna(chg_pct)
+
+        f"{change_pct:+.2f}%"
+
+        if change_pct is not None
+
         else "-"
     )
 
-    # ========================================================
-    # Nasdaq-100 Futures
-    # ========================================================
+    market_state = str(
+        row[
+            "autoMarketStateDisplay"
+        ]
+    )
 
-    if nq_price is not None:
+    if today_event:
 
-        nq_change_text = (
-            f"{nq_change_pct:+.2f}%"
-            if nq_change_pct is not None
-            else "-"
+        action_text = (
+            f"신호: "
+            f"{today_event['action']}"
         )
 
-        nq_line = (
-            f"나스닥100 선물: "
-            f"<b>{nq_price:,.2f}</b> "
-            f"({nq_change_text})"
+    elif state["tp3Lock"]:
+
+        action_text = (
+            "⏸️ 매매 없음 · "
+            "TP3 Lock 유지"
+        )
+
+    elif state["stage"] == 0:
+
+        action_text = (
+            "⏸️ 매매 없음 · "
+            "신규 매수신호 대기"
+        )
+
+    elif state["stage"] == 1:
+
+        action_text = (
+            "⏸️ 매매 없음 · "
+            "추가매수/익절 신호 대기"
+        )
+
+    elif state["stage"] == 2:
+
+        action_text = (
+            "⏸️ 매매 없음 · "
+            "익절/GC/DC 신호 대기"
         )
 
     else:
 
-        nq_line = (
-            "나스닥100 선물: -"
+        action_text = (
+            "⏸️ 매매 없음 · "
+            "익절/DC 신호 대기"
         )
-
-    # ========================================================
-    # 최종 메시지
-    # ========================================================
 
     lines = [
 
         "❄️ <b>눈덩이 티큐 궁극</b>",
+
         "",
+
         "📊 <b>일일 현황</b>",
-        f"평가기준일: {dt.strftime('%Y-%m-%d')}",
+
+        "평가기준일: "
+        f"{last_date.strftime('%Y-%m-%d')}",
+
         "",
-        f"TQQQ 종가: <b>{fmt(close)}</b> "
+
+        f"TQQQ 종가: "
+        f"<b>{fmt(close)}</b> "
         f"({change_text})",
-        f"QQQ 종가: <b>{fmt(row['QQQ'])}</b>",
-        nq_line,
+
+        f"QQQ 종가: "
+        f"<b>{fmt(row['QQQ_Close'])}</b>",
+
         "",
-        f"🧭 <b>현재 시장상태: {market_state}</b>",
+
+        f"🧭 <b>현재 시장상태: "
+        f"{html.escape(market_state)}</b>",
+
+        f"Risk: "
+        f"{html.escape(str(row['riskStatus']))}",
+
+        f"QQQ DD: "
+        f"{fmt(row['qqq_dd'])}%",
+
+        f"VIX Ratio: "
+        f"{fmt(row['vixRatio'], 2)}",
+
+        f"TP2: "
+        f"+{float(row['tp2Pct']):.0f}% / "
+        f"{float(row['tp2SellPct']):.0f}%",
+
+        f"Stage: "
+        f"{stage_text(state['stage'])}",
+
         "",
+
         "📌 <b>오늘 행동지침</b>",
+
         action_text,
     ]
+
+    if today_event:
+
+        lines += [
+
+            "",
+
+            f"✅ 오늘 신호: "
+            f"<b>{html.escape(today_event['action'])}</b>",
+        ]
 
     return "\n".join(lines)
 
 
 # ============================================================
-# 8. MAIN
+# 9. MAIN
 # ============================================================
 
-def calc_signal():
+def main():
 
-    # ========================================================
-    # 데이터
-    # ========================================================
+    print(
+        "[DATA] Yahoo Finance 데이터 다운로드 중..."
+    )
 
     data = download_data()
+
+    print(
+        "[CALC] TradingView Pine MATCH 계산 중..."
+    )
 
     data = prepare_indicators(
         data
     )
 
-    # ========================================================
-    # 마지막 확정 TQQQ 거래일
-    # ========================================================
-
-    latest_tqqq = (
-        data["TQQQ_CLOSE"]
+    valid = (
+        data[
+            "TQQQ_Close"
+        ]
         .dropna()
-        .index
-        .max()
     )
 
-    if pd.isna(
-        latest_tqqq
-    ):
+    if valid.empty:
 
-        print(
-            "[SKIP] 유효한 TQQQ 일봉 데이터가 없습니다."
+        raise RuntimeError(
+            "유효한 TQQQ 데이터가 없습니다."
         )
 
-        return
-
-    today = latest_tqqq
+    latest_date = (
+        valid.index.max()
+    )
 
     print(
-        "[DATA] Ultimate 기준일: "
-        f"{today.strftime('%Y-%m-%d')}"
+        "[DATA] 기준일: "
+        f"{latest_date.strftime('%Y-%m-%d')}"
     )
 
-    # ========================================================
-    # Nasdaq-100 Futures
-    # ========================================================
-
-    nq_price, nq_change_pct = (
-        get_nasdaq_futures()
-    )
-
-    # ========================================================
-    # State
-    # ========================================================
-
-    state = load_state()
-
-    # 전체 replay
-    state, events = replay(
-        data,
-        state,
-        send_alerts=True
-    )
-
-    # ========================================================
-    # 오늘 데이터
-    # ========================================================
-
-    last_date = today
-
-    # ========================================================
-    # TQQQ 전일 종가
-    # ========================================================
-
-    prev_close = None
-
-    try:
-
-        pos = data.index.get_loc(
-            last_date
+    state, events = (
+        replay_pine_signals(
+            data,
+            START_DATE
         )
+    )
 
-        if pos > 0:
+    today_events = [
+        event
+        for event in events
+        if event["date"]
+        == latest_date
+    ]
 
-            prev_close = float(
-                data.iloc[
-                    pos - 1
-                ]["TQQQ_CLOSE"]
-            )
+    today_event = (
+        today_events[-1]
+        if today_events
+        else None
+    )
 
-    except Exception:
-
-        prev_close = None
-
-    # ========================================================
-    # 오늘 Signal 확인
-    # ========================================================
-
-    today_signal = None
+    # --------------------------------------------------------
+    # Signal alert
+    # --------------------------------------------------------
 
     sent = 0
 
-    for event in events:
+    if today_event:
 
-        kind = event[0]
-        dt = event[1]
+        action = today_event[
+            "action"
+        ]
 
-        if dt != last_date:
+        key = (
+            f"SIGNAL|"
+            f"{latest_date.strftime('%Y-%m-%d')}|"
+            f"{action}"
+        )
 
-            continue
-
-        if kind == "SIGNAL":
-
-            _, dt, reason, close, meta = event
-
-            today_signal = reason
-
-            key = (
-                f"SIGNAL|"
-                f"{dt.strftime('%Y-%m-%d')}|"
-                f"{reason}"
+        if (
+            state.get(
+                "last_alert_key"
             )
-
-            if (
-                state.get(
-                    "last_alert_key"
-                )
-                == key
-            ):
-
-                continue
-
-            row = data.loc[
-                dt
-            ]
-
-            msg = build_signal_message(
-                dt,
-                reason,
-                close,
-                meta,
-                row
-            )
+            != key
+        ):
 
             send_telegram(
-                msg
+                build_signal_message(
+                    today_event
+                )
             )
 
-            state["last_alert_key"] = key
+            state[
+                "last_alert_key"
+            ] = key
 
-            sent += 1
+            sent = 1
 
-    # ========================================================
-    # 매일 일일현황 전송
-    # ========================================================
+            print(
+                f"[ALERT] "
+                f"{latest_date.strftime('%Y-%m-%d')} "
+                f"{action}"
+            )
+
+        else:
+
+            print(
+                f"[SKIP] 이미 전송한 신호: "
+                f"{key}"
+            )
+
+    # --------------------------------------------------------
+    # Daily status
+    # --------------------------------------------------------
 
     daily_key = (
         f"DAILY|"
-        f"{last_date.strftime('%Y-%m-%d')}"
+        f"{latest_date.strftime('%Y-%m-%d')}"
     )
 
     if (
@@ -2488,47 +2026,70 @@ def calc_signal():
         != daily_key
     ):
 
-        latest_row = data.loc[
-            last_date
-        ]
-
-        daily_msg = build_daily_status_message(
-            last_date,
-            state,
-            latest_row,
-            today_signal,
-            prev_close,
-            nq_price,
-            nq_change_pct
+        daily_msg = (
+            build_daily_status_message(
+                data,
+                state,
+                latest_date,
+                today_event
+            )
         )
 
         send_telegram(
             daily_msg
         )
 
-        state["last_daily_key"] = (
-            daily_key
-        )
+        state[
+            "last_daily_key"
+        ] = daily_key
 
-    # ========================================================
-    # State 저장
-    # ========================================================
+    state[
+        "last_processed_date"
+    ] = (
+        latest_date.strftime(
+            "%Y-%m-%d"
+        )
+    )
 
     save_state(
         state
     )
 
+    current_market = (
+        data.loc[
+            latest_date,
+            "autoMarketStateDisplay"
+        ]
+    )
+
+    current_tp2 = float(
+        data.loc[
+            latest_date,
+            "tp2Pct"
+        ]
+    )
+
+    current_tp2_sell = float(
+        data.loc[
+            latest_date,
+            "tp2SellPct"
+        ]
+    )
+
     print(
         f"[OK] "
-        f"{today.strftime('%Y-%m-%d')} | "
+        f"{latest_date.strftime('%Y-%m-%d')} | "
         f"Stage={state['stage']} | "
-        f"TP1={state['tp1_done']} | "
-        f"TP2={state['tp2_done']} | "
-        f"TP3Lock={state['tp3_lock']} | "
+        f"TP1={state['tp1Fired']} | "
+        f"TP2={state['tp2Fired']} | "
+        f"TP3Lock={state['tp3Lock']} | "
+        f"Market={current_market} | "
+        f"TP2={current_tp2:.0f}% / "
+        f"{current_tp2_sell:.0f}% | "
         f"NewAlerts={sent}"
     )
 
 
 if __name__ == "__main__":
 
-    calc_signal()
+    main()
