@@ -264,9 +264,23 @@ def add_weekly_state_columns(x: pd.DataFrame) -> pd.DataFrame:
 
     tclose = x["TQQQ_Close"].copy()
 
-    weekly = tclose.resample("W-FRI").last().dropna()
-    weekly["w5"] = weekly.rolling(5, min_periods=5).mean()
-    weekly["w20"] = weekly.rolling(20, min_periods=20).mean()
+    weekly = (
+        tclose
+        .resample("W-FRI")
+        .last()
+        .dropna()
+        .to_frame("close")
+    )
+
+    weekly["w5"] = weekly["close"].rolling(
+        5,
+        min_periods=5
+    ).mean()
+
+    weekly["w20"] = weekly["close"].rolling(
+        20,
+        min_periods=20
+    ).mean()
 
     # 현재 주 -> 이전 완료 주봉 값
     weekly["prev_close"] = weekly["close"].shift(1)
