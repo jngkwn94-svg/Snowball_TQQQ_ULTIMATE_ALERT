@@ -2,7 +2,7 @@ name: TQQQ Alert
 
 on:
   schedule:
-    - cron: '15 20 * * 1-5'  # 기존 김째매매법과 동일한 UTC 20:15 / 한국시간 기준 알림 시각
+    - cron: '15 20 * * 1-5'  # UTC 20:15 = 한국시간 다음날 05:15
   workflow_dispatch:
 
 jobs:
@@ -23,4 +23,4 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python Snowball_TQQQ_ULTIMATE_ALERT_v2.0.py
+        run: python Snowball_TQQQ_ULTIMATE_TV_MATCH.py
