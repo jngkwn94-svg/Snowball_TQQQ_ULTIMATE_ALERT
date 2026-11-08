@@ -1,26 +1,67 @@
-name: TQQQ Alert
+name: snowball-tqqq-alert
 
 on:
   schedule:
-    - cron: '15 20 * * 1-5'  # UTC 20:15 = 한국시간 다음날 05:15
+    # [정규 마감일] 미국 정규장 마감(16:00 ET) 12분 / 27분 / 57분 뒤에 시도합니다.
+    #  - 서머타임(마감 20:00 UTC)과 표준시(마감 21:00 UTC) 둘 다 걸어두고,
+    #    마감 전에 도는 실행은 스크립트가 거래소 달력으로 판단해 건너뜁니다.
+    - cron: "12 20 * * 1-5"
+    - cron: "27 20 * * 1-5"
+    - cron: "57 20 * * 1-5"
+    - cron: "12 21 * * 1-5"
+    - cron: "27 21 * * 1-5"
+    - cron: "57 21 * * 1-5"
+    # [조기 마감일] 13:00 ET 마감(7월, 추수감사절 다음 날, 12월 24일 등) 12분 / 27분 뒤.
+    #  조기 마감이 있는 달(7, 11, 12월)에만 걸었고, 조기 마감일이 아니면 스크립트가 바로 종료합니다.
+    - cron: "12 17,18 * 7,11,12 1-5"
+    - cron: "27 17,18 * 7,11,12 1-5"
   workflow_dispatch:
+    inputs:
+      force_send:
+        description: "1이면 마감/중복 확인 없이 가장 최근 봉으로 지금 바로 발송 (테스트용, 기록은 저장 안 함)"
+        default: "0"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: snowball-alert
+  cancel-in-progress: false
 
 jobs:
   alert:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.12"
+          cache: pip
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - run: pip install -r requirements.txt
 
-      - name: Run Ultimate alert
+      - name: 신호 계산 및 텔레그램 발송
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python Snowball_TQQQ_ULTIMATE_TV_MATCH.py
+          NOTIFY_MODE: always        # signals 로 바꾸면 신호가 난 날만 발송
+          RSI_MODE: 표대로            # 끄기 | 축소형 | 표대로 (TradingView 지표 모드와 동일하게)
+          FORCE_SEND: ${{ github.event.inputs.force_send }}
+        run: python snowball_bot.py
+
+      # 위 단계가 실패해도(오류 알림 기록 등) 상태 파일은 저장합니다.
+      - name: 발송 기록 저장
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain state)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add state
+            git commit -m "update state [skip ci]"
+            for i in 1 2 3; do
+              git pull --rebase -q && git push && break
+              echo "push 재시도 $i"; sleep 5
+            done
+          fi
