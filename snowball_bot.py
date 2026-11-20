@@ -1,4 +1,3 @@
-```python
 #!/usr/bin/env python3
 """
 눈덩이티큐 ULTIMATE (DC 이후 DIP 재확인 + RSI 보너스) - 종가 직후 텔레그램 알림 봇 [개선판]
@@ -543,4 +542,3 @@ if __name__ == "__main__":
         except Exception as e2:
             print(f"[ERROR] 오류 알림 발송 실패: {e2!r}")
         sys.exit(1)
-```
