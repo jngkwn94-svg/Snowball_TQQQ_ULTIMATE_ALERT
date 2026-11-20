@@ -1,21 +1,20 @@
+```python
 #!/usr/bin/env python3
 """
-눈덩이티큐 ULTIMATE (DC 이후 DIP 재확인 + RSI 보너스) - 종가 직후 텔레그램 알림 봇 [최종판]
+눈덩이티큐 ULTIMATE (DC 이후 DIP 재확인 + RSI 보너스) - 종가 직후 텔레그램 알림 봇 [개선판]
 
-동작
-- 야후 파이낸스에서 TQQQ / QQQ / ^VIX / ^VIX3M 일봉을 받아, 2010-02부터 상태(stage, 평단, TP/LOCK/재확인 플래그)를
-  처음부터 다시 계산합니다. (TradingView 지표가 차트 첫 봉부터 상태를 쌓는 것과 같은 방식)
-- NYSE 거래소 달력(exchange_calendars)으로 휴장일, 주말, 조기 마감일(13:00 ET), 서머타임을 자동 처리합니다.
-  종가 확정 시각 = 그날의 실제 마감 시각 + 10분.
-- 야후 종가가 최종값으로 올라왔는지 확인하고(연속 2회 조회 값이 같을 때) 보냅니다.
-- 이전에 보낸 날짜(state/last_notified.json) 이후에 놓친 신호가 있으면 "놓친 신호"로 먼저 보내고, 이어서 오늘 메시지를 보냅니다.
-- 마감 후 45분이 지나도 데이터가 안 올라오거나 오류가 나면 텔레그램으로 경고를 보냅니다(하루 1회).
+개선 사항
+1. fetch_final()에서 TQQQ뿐만 아니라 QQQ, ^VIX, ^VIX3M 4개 종목 모두 당일 봉이 올라올 때까지 대기
+2. 야후 1d 일봉 반영이 지연될 경우, 당일 정규장(09:30~마감시각 ET) 5분봉으로 종가/고가를 보완
+3. 수동 매매 상태(MANUAL_OVERRIDE=1 또는 state/manual_position.json) 반영 가능
+4. 가독성 개선형 텔레그램 요약(다음 신호까지 남은 거리 명시)
 
 필요한 환경변수: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-선택:
-  NOTIFY_MODE = always(기본, 매 거래일 요약 발송) | signals(신호 날만 발송)
-  RSI_MODE    = 끄기 | 축소형 | 표대로(기본)   (잘못된 값이면 표대로로 대체하고 경고)
-  FORCE_SEND  = 1  마감/중복 확인을 무시하고 가장 최근 봉으로 지금 바로 발송(테스트용, 기록은 저장하지 않음)
+선택 환경변수:
+  NOTIFY_MODE = always(기본) | signals
+  RSI_MODE    = 끄기 | 축소형 | 표대로(기본)
+  FORCE_SEND  = 1 (테스트용, 기록 저장 안 함)
+  MANUAL_STAGE = 1 / MANUAL_SHARES = 0 / MANUAL_RECH = 1 (실제 계좌 상태 덮어쓰기)
 """
 import json
 import os
@@ -38,66 +37,35 @@ P = dict(
     tp1=15.0, tp1_sell=50, tp2=100.0, tp2_sell=35, tp3=350.0,
 )
 ET = ZoneInfo("America/New_York")
+KST = ZoneInfo("Asia/Seoul")
 STATE_PATH = os.path.join("state", "last_notified.json")
 HISTORY_START = "2009-01-01"
 
-# 타이밍 설정
-BUFFER_MIN = 10     # 마감 후 이 시간(분)이 지나야 종가 확정으로 봄
-LATE_MIN = 45       # 마감 후 이 시간(분)이 지나도 못 보내면 경고/불완전 데이터로 발송
-MAX_TRIES = 8       # 한 번 실행 안에서 야후 조회 재시도 횟수
-RETRY_WAIT = 60     # 봉이 아직 없을 때 대기(초)
-STABLE_WAIT = 45    # 종가 안정 확인 사이 대기(초)
-CATCHUP_MAX_BARS = 40  # 놓친 신호를 찾아볼 최대 거래일 수
+# 타이밍 설정 (외부 정각 크론 연동에 맞춰 빠른 재시도)
+BUFFER_MIN = 8       # 마감 후 이 시간(분)이 지나야 종가 확정으로 봄
+LATE_MIN = 45        # 마감 후 이 시간(분)이 지나도 못 보내면 경고/불완전 데이터로 발송
+MAX_TRIES = 10       # 한 번 실행 안에서 야후 조회 재시도 횟수
+RETRY_WAIT = 30      # 봉이 아직 없을 때 대기(초)
+STABLE_WAIT = 20     # 종가 안정 확인 사이 대기(초)
+CATCHUP_MAX_BARS = 40
 
-# RSI 보너스 (TradingView 지표 입력값과 동일하게 맞출 것)
-RSI_MODE = os.getenv("RSI_MODE", "표대로")  # 끄기 | 축소형 | 표대로
+# RSI 보너스
+RSI_MODE = os.getenv("RSI_MODE", "표대로")
 RSI_LEN = 14
-RSI_MID = 35.0       # RSI 이 값 이하: 보너스
-RSI_EXTREME = 30.0   # RSI 이 값 이하: 극단 보너스
-DIP1_BASE_W = 30.0   # DIP1 기본 목표 비중(%)
-DIP2_BASE_W = 70.0   # DIP2 기본 목표 비중(%)
-BONUS_TABLE = {"끄기": (0.0, 0.0), "축소형": (5.0, 7.5), "표대로": (10.0, 15.0)}  # (mid, extreme) %p
+RSI_MID = 35.0
+RSI_EXTREME = 30.0
+DIP1_BASE_W = 30.0
+DIP2_BASE_W = 70.0
+BONUS_TABLE = {"끄기": (0.0, 0.0), "축소형": (5.0, 7.5), "표대로": (10.0, 15.0)}
 if RSI_MODE not in BONUS_TABLE:
-    print(f"[WARN] RSI_MODE='{RSI_MODE}' 은(는) 올바른 값이 아닙니다(끄기/축소형/표대로). '표대로'로 대체합니다.")
+    print(f"[WARN] RSI_MODE='{RSI_MODE}' 잘못된 값 -> '표대로'로 대체")
     RSI_MODE = "표대로"
 
-_ctx = {"late": False, "expected": None}  # 오류 알림 판단용
+_ctx = {"late": False, "expected": None}
 
 
 class BotError(Exception):
     pass
-
-
-# ---------------- 데이터 ----------------
-def _hist(ticker: str, tries: int = 3) -> pd.DataFrame:
-    import yfinance as yf
-    err = None
-    for k in range(tries):
-        try:
-            h = yf.Ticker(ticker).history(start=HISTORY_START, auto_adjust=False)
-            if h is not None and not h.empty:
-                h.index = pd.to_datetime(h.index.date)  # 거래일 날짜만 사용
-                return h[~h.index.duplicated(keep="last")]
-            err = RuntimeError(f"{ticker} 데이터가 비어 있습니다")
-        except Exception as e:  # 네트워크 일시 오류 등
-            err = e
-        _time.sleep(5 * (k + 1))
-    raise BotError(f"{ticker} 다운로드 실패: {err}")
-
-
-def fetch_data():
-    """(df, last) 반환. last 는 각 시리즈의 마지막 날짜."""
-    tq, qq, vx, v3 = _hist("TQQQ"), _hist("QQQ"), _hist("^VIX"), _hist("^VIX3M")
-    qq = qq.copy()
-    qq["hh"] = qq["High"].rolling(P["dip_lookback"]).max()  # ta.highest(high, 126) (QQQ 일봉)
-    df = pd.DataFrame({"c": tq["Close"]})
-    df = df[df.index >= "2010-02-11"]
-    df["qc"] = qq["Close"].reindex(df.index).ffill()
-    df["qh"] = qq["hh"].reindex(df.index).ffill()
-    df["vix"] = vx["Close"].reindex(df.index).ffill()
-    df["vix3"] = v3["Close"].reindex(df.index).ffill()
-    last = {"TQQQ": tq.index.max(), "QQQ": qq.index.max(), "VIX": vx.index.max(), "VIX3M": v3.index.max()}
-    return df.dropna(subset=["c"]), last
 
 
 # ---------------- 거래소 달력 / 마감 판단 ----------------
@@ -106,7 +74,7 @@ def get_calendar():
         import exchange_calendars as xcals
         return xcals.get_calendar("XNYS")
     except Exception as e:
-        print(f"[WARN] 거래소 달력을 불러오지 못해 '평일 16:00 ET' 기준으로 대체합니다: {e}")
+        print(f"[WARN] 거래소 달력 로드 실패, 평일 16:00 ET 대체: {e}")
         return None
 
 
@@ -120,7 +88,6 @@ def _is_session(cal, d: date) -> bool:
 
 
 def session_close_utc(cal, d: date) -> datetime:
-    """그날 정규장 실제 마감 시각(UTC). 조기 마감일은 13:00 ET."""
     if cal is not None:
         try:
             if cal.is_session(pd.Timestamp(d)):
@@ -131,7 +98,6 @@ def session_close_utc(cal, d: date) -> datetime:
 
 
 def latest_completed_session(now_utc: datetime, cal):
-    """now 시점에 '마감 + BUFFER_MIN' 이 지난 가장 최근 거래일(ET 날짜)."""
     today = now_utc.astimezone(ET).date()
     for back in range(0, 14):
         d = today - timedelta(days=back)
@@ -140,6 +106,82 @@ def latest_completed_session(now_utc: datetime, cal):
         if now_utc >= session_close_utc(cal, d) + timedelta(minutes=BUFFER_MIN):
             return d
     return None
+
+
+# ---------------- 데이터 (1d 일봉 + 지연 시 5m 정규장 폴백) ----------------
+def _hist(ticker: str, tries: int = 3) -> pd.DataFrame:
+    import yfinance as yf
+    err = None
+    for k in range(tries):
+        try:
+            h = yf.Ticker(ticker).history(start=HISTORY_START, auto_adjust=False)
+            if h is not None and not h.empty:
+                h.index = pd.to_datetime(h.index.date)
+                return h[~h.index.duplicated(keep="last")]
+            err = RuntimeError(f"{ticker} 데이터가 비어 있습니다")
+        except Exception as e:
+            err = e
+        _time.sleep(3 * (k + 1))
+    raise BotError(f"{ticker} 다운로드 실패: {err}")
+
+
+def _intraday_regular_bar(ticker: str, target_date: date, close_et: time):
+    """1d 일봉이 아직 안 올라왔을 때 당일 정규장(09:30~마감) 5분봉으로 종가/고가 보완."""
+    import yfinance as yf
+    try:
+        m = yf.Ticker(ticker).history(period="5d", interval="5m", prepost=False, auto_adjust=False)
+        if m is None or m.empty:
+            return None
+        if m.index.tz is None:
+            m.index = m.index.tz_localize(ET)
+        else:
+            m.index = m.index.tz_convert(ET)
+        day_df = m[m.index.date == target_date]
+        day_df = day_df[(day_df.index.time >= time(9, 30)) & (day_df.index.time <= close_et)]
+        if day_df.empty:
+            return None
+        # 마감 10분 이내 봉이 있으면 정규장 마감 데이터로 인정
+        last_t = day_df.index[-1].time()
+        cutoff = (datetime.combine(target_date, close_et) - timedelta(minutes=10)).time()
+        if last_t < cutoff:
+            return None
+        return {
+            "Open": float(day_df["Open"].iloc[0]),
+            "High": float(day_df["High"].max()),
+            "Low": float(day_df["Low"].min()),
+            "Close": float(day_df["Close"].iloc[-1]),
+        }
+    except Exception:
+        return None
+
+
+def fetch_data(expected: date = None, cal=None, allow_5m_fallback: bool = True):
+    """(df, last, fallback_used) 반환."""
+    raw = {t: _hist(t) for t in ("TQQQ", "QQQ", "^VIX", "^VIX3M")}
+    fallback_used = []
+
+    if expected is not None and allow_5m_fallback:
+        close_et = session_close_utc(cal, expected).astimezone(ET).time()
+        ts = pd.Timestamp(expected)
+        for t in ("TQQQ", "QQQ", "^VIX", "^VIX3M"):
+            if raw[t].index.max().date() < expected:
+                bar = _intraday_regular_bar(t, expected, close_et)
+                if bar is not None:
+                    row = pd.DataFrame([bar], index=[ts])
+                    raw[t] = pd.concat([raw[t], row])
+                    raw[t] = raw[t][~raw[t].index.duplicated(keep="last")].sort_index()
+                    fallback_used.append(t)
+
+    tq, qq, vx, v3 = raw["TQQQ"], raw["QQQ"].copy(), raw["^VIX"], raw["^VIX3M"]
+    qq["hh"] = qq["High"].rolling(P["dip_lookback"]).max()
+    df = pd.DataFrame({"c": tq["Close"]})
+    df = df[df.index >= "2010-02-11"]
+    df["qc"] = qq["Close"].reindex(df.index).ffill()
+    df["qh"] = qq["hh"].reindex(df.index).ffill()
+    df["vix"] = vx["Close"].reindex(df.index).ffill()
+    df["vix3"] = v3["Close"].reindex(df.index).ffill()
+    last = {"TQQQ": tq.index.max(), "QQQ": qq.index.max(), "VIX": vx.index.max(), "VIX3M": v3.index.max()}
+    return df.dropna(subset=["c"]), last, fallback_used
 
 
 # ---------------- RSI (TradingView ta.rsi 와 동일한 RMA 방식) ----------------
@@ -165,7 +207,7 @@ def rsi_tv(close, n: int = 14) -> np.ndarray:
     return r
 
 
-# ---------------- 신호/상태 계산 (Pine 로직 그대로 + RSI 보너스) ----------------
+# ---------------- 신호/상태 계산 ----------------
 def compute(df: pd.DataFrame, p: dict = P, mode: str = None) -> pd.DataFrame:
     mode = mode or RSI_MODE
     b_mid, b_ext = BONUS_TABLE[mode]
@@ -205,7 +247,7 @@ def compute(df: pd.DataFrame, p: dict = P, mode: str = None) -> pd.DataFrame:
     avg = np.nan
     t1 = t2 = t3 = lock = False
     reent = rech = False
-    wcur = 0.0  # 현재 단계의 TQQQ 목표 비중(0~1), 평단 가중 계산용
+    wcur = 0.0
     out = {k: [] for k in ("act", "stage_prev", "avg_prev", "stage", "avg", "t1", "t2", "t3", "lock", "reent", "rech", "w_prev", "w")}
 
     for i in range(len(d)):
@@ -269,11 +311,11 @@ def compute(df: pd.DataFrame, p: dict = P, mode: str = None) -> pd.DataFrame:
 STAGE_TXT = {0: "현금 대기", 1: "DIP1", 2: "DIP2", 3: "GC 보유"}
 ACTION_TXT = {
     "DC": ("🔴", "DC", "전량 매도"),
-    "TP3": ("🔴", "TP3", "전량 매도 후 LOCK (다음 DIP1에서 해제)"),
-    "TP1": ("🟡", "TP1", "보유 수량의 50% 매도"),
-    "TP2": ("🟡", "TP2", "보유 수량의 35% 매도"),
-    "GC": ("🟢", "GC", "전체 자산의 100%까지 매수"),
-    "DIP1": ("🟢", "DIP1", ""),   # 비중은 RSI에 따라 달라서 build_message 에서 채움
+    "TP3": ("🔴", "TP3", "전량 매도 후 LOCK"),
+    "TP1": ("🟡", "TP1", "보유 수량 50% 매도"),
+    "TP2": ("🟡", "TP2", "보유 수량 35% 매도"),
+    "GC": ("🟢", "GC", "전체 자산 100%까지 매수"),
+    "DIP1": ("🟢", "DIP1", ""),
     "DIP2": ("🟢", "DIP2", ""),
 }
 
@@ -290,47 +332,67 @@ def fmt(x, nd=2, pct=False):
 
 def build_message(d: pd.DataFrame, missed: bool = False, warnings=None) -> str:
     r = d.iloc[-1]
-    prev_close = d.c.iloc[-2] if len(d) > 1 else np.nan
-    chg = (r.c / prev_close - 1) * 100 if not np.isnan(prev_close) else np.nan
-    date = d.index[-1].strftime("%Y-%m-%d")
-    head = f"⚠️ 놓친 신호 · {date} 미국장 마감" if missed else f"❄️ 눈덩이티큐 ULTIMATE · {date} 미국장 마감"
-    lines = [head, ""]
+    prev_tqqq = d.c.iloc[-2] if len(d) > 1 else np.nan
+    prev_qqq = d.qc.iloc[-2] if len(d) > 1 else np.nan
+    chg_t = (r.c / prev_tqqq - 1) * 100 if not np.isnan(prev_tqqq) else np.nan
+    chg_q = (r.qc / prev_qqq - 1) * 100 if not np.isnan(prev_qqq) else np.nan
+    kst_now = datetime.now(KST).strftime("%m-%d %H:%M")
+    dt_str = d.index[-1].strftime("%Y-%m-%d")
+
+    # 수동 계좌 상태 오버라이드 확인
+    manual_stage = os.getenv("MANUAL_STAGE")
+    manual_shares = os.getenv("MANUAL_SHARES")
+    eff_stage = int(manual_stage) if manual_stage is not None and manual_stage.isdigit() else int(r.stage)
+    shares_txt = f"{manual_shares}주 (수동)" if manual_shares is not None else f"전략추적({STAGE_TXT[eff_stage]})"
+
+    # 상단 핵심 요약(무엇이 얼마나 남았는지 명시)
     if r.act:
         emo, name, what = ACTION_TXT[r.act]
         if r.act in ("DIP1", "DIP2"):
             tgt = r.dip1_t if r.act == "DIP1" else r.dip2_t
-            what = f"전체 자산의 {wtxt(tgt)}까지 매수"
-            lines += [f"{emo} 신호: {name} → {what}"]
-            lines += [f"   RSI {fmt(r.rsi, 1)} · 보너스 +{r.bonus:g}%p ({RSI_MODE})"]
-        else:
-            lines += [f"{emo} 신호: {name} → {what}"]
-        if r.act in ("DC", "TP1", "TP2", "TP3") and not np.isnan(r.avg_prev):
-            lines += [f"   (전략 평단 {fmt(r.avg_prev)} 대비 {fmt((r.c / r.avg_prev - 1) * 100, 2, True)})"]
-        lines += [f"   상태: {STAGE_TXT[r.stage_prev]} → {STAGE_TXT[r.stage]}", ""]
+            what = f"전체 자산 {wtxt(tgt)}까지 매수"
+        summary = f"{emo} {name} 발동 · {what}"
+    elif eff_stage == 0:
+        dist = r.dd - r.trig
+        summary = f"대기 · DIP1까지 QQQ DD {abs(dist):.2f}%p 남음" if dist > 0 else "대기 · DIP1 조건 충족(재확인 대기)"
+    elif eff_stage == 1:
+        dist = r.dd - P["dip2"]
+        summary = f"대기 · DIP2까지 QQQ DD {dist:.2f}%p 남음" if dist > 0 else "대기 · DIP2 낙폭 충족(Z200/재확인 확인)"
     else:
-        lines += ["✅ 오늘 신호 없음", f"   상태: {STAGE_TXT[r.stage]}", ""]
-    lines += [
-        f"TQQQ 종가 {fmt(r.c)} ({fmt(chg, 2, True)})",
-        f"RSI {fmt(r.rsi, 1)} · 지금 DIP가 나면 DIP1 {wtxt(r.dip1_t)} / DIP2 {wtxt(r.dip2_t)} ({RSI_MODE})",
-        f"QQQ 고점 대비 {fmt(r.dd, 1, True)} · DIP1 기준 {fmt(r.trig, 1, True)} · VIX비율 {fmt(r.vr)}",
-        f"GC Gap {fmt(r.gap * 100, 2, True)} · Z200 {fmt(r.z200, 2, True)} · 5MA {fmt(r.ma5)} / 220MA {fmt(r.ma220)}",
+        summary = f"유지 · {STAGE_TXT[eff_stage]}"
+
+    head = f"⚠️ 놓친 신호 · {dt_str} 마감" if missed else f"❄️ 눈덩이 티큐 일일 점검"
+    lines = [
+        head,
+        f"{dt_str} 미국장 마감 (KST {kst_now}) · {summary}",
+        "",
+        f"📊 현황 (Stage {eff_stage} · 보유 {shares_txt})",
+        f"• TQQQ: ${fmt(r.c)} ({fmt(chg_t, 2, True)})",
+        f"• QQQ: ${fmt(r.qc)} ({fmt(chg_q, 2, True)}) · 낙폭 {fmt(r.dd, 2, True)}",
+        f"• RSI(14): {fmt(r.rsi, 1)} · VIX비율: {fmt(r.vr)} (DIP1 기준 {fmt(r.trig, 0, True)})",
+        f"• Z200: {fmt(r.z200, 2, True)} · GC Gap: {fmt(r.gap * 100, 2, True)}",
+        "",
+        "✅ 조건 점검",
     ]
-    if r.stage >= 1 and not np.isnan(r.avg):
-        tp = []
-        if not r.t1:
-            tp.append(f"TP1 {fmt(r.avg * (1 + P['tp1'] / 100))}")
-        if r.t1 and not r.t2:
-            tp.append(f"TP2 {fmt(r.avg * (1 + P['tp2'] / 100))}")
-        if not r.t3 and not r.lock:
-            tp.append(f"TP3 {fmt(r.avg * (1 + P['tp3'] / 100))}")
-        lines += [f"전략 평단 {fmt(r.avg)} · 다음 목표 " + " / ".join(tp)]
-    if r.reent:
-        lines += ["⏳ DC/TP3 이후 DIP1 재확인 대기 중 (조건이 이미 참이어도 다음 거래일 신호 가능)"]
-    if r.rech and r.stage == 1:
-        lines += ["⏳ DIP2 재확인 대기 중"]
+
+    if eff_stage == 0:
+        dd_ok = r.dd <= r.trig
+        lines.append(f"• {'🟢' if dd_ok else '🔴'} DIP1 (QQQ ≤ {fmt(r.trig, 0, True)}): {fmt(r.dd, 2, True)}" + ("" if dd_ok else f" ({r.dd - r.trig:.2f}%p 남음)"))
+    elif eff_stage == 1:
+        d2_ok = r.dd <= P["dip2"]
+        z_ok = r.z200 <= P["dip2_z200_max"]
+        lines.append(f"• {'🟢' if d2_ok else '🔴'} DIP2 낙폭 (QQQ ≤ -22%): {fmt(r.dd, 2, True)}" + ("" if d2_ok else f" (QQQ DD {r.dd - P['dip2']:.2f}%p 남음)"))
+        lines.append(f"• {'🟢' if z_ok else '🔴'} DIP2 Z200 (≤ -7%): {fmt(r.z200, 2, True)}")
+    if eff_stage >= 1 and not np.isnan(r.avg) and manual_shares != "0":
+        lines.append(f"• 전략 평단 ${fmt(r.avg)} (수익률 {fmt((r.c / r.avg - 1) * 100, 2, True)})")
+
+    lines += ["", f"🎯 행동: {summary}"]
+    if r.act in ("DIP1", "DIP2"):
+        tgt = r.dip1_t if r.act == "DIP1" else r.dip2_t
+        lines.append(f"   → RSI {fmt(r.rsi, 1)} ({RSI_MODE}) 적용 목표 비중 {wtxt(tgt)}")
+
     for w in (warnings or []):
-        lines += [f"⚠️ {w}"]
-    lines += ["", "※ 평단과 수량은 전략 내부 추적값입니다. 실제 계좌와 다를 수 있습니다."]
+        lines.append(f"⚠️ {w}")
     return "\n".join(lines)
 
 
@@ -345,7 +407,7 @@ def send_telegram(text: str) -> None:
             if resp.status_code == 200:
                 return
             err = f"{resp.status_code} {resp.text[:200]}"
-            if resp.status_code == 429:  # 너무 빠른 전송: 안내된 시간만큼 대기
+            if resp.status_code == 429:
                 try:
                     _time.sleep(float(resp.json().get("parameters", {}).get("retry_after", 3)) + 1)
                     continue
@@ -374,23 +436,25 @@ def save_state(**kw) -> None:
         json.dump(st, f, ensure_ascii=False)
 
 
-# ---------------- 야후 종가 확정 대기 ----------------
-def fetch_final(expected: date, sleep=_time.sleep):
-    """expected 일봉이 야후에 올라오고 값이 안정될 때까지 기다림. (df, last, final) 반환."""
-    prev, df, last = None, None, None
+# ---------------- 야후 4종목 동시 확정 대기 ----------------
+def fetch_final(expected: date, cal, sleep=_time.sleep):
+    """TQQQ/QQQ/^VIX/^VIX3M 4개 모두 expected 봉이 올라오고 안정될 때까지 대기."""
+    prev, df, last, fb = None, None, None, []
     for _ in range(MAX_TRIES):
-        df, last = fetch_data()
-        if df.index[-1].date() >= expected:
-            sig = (round(float(df.c.iloc[-1]), 2), round(float(df.qc.iloc[-1]), 2))
+        df, last, fb = fetch_data(expected=expected, cal=cal, allow_5m_fallback=True)
+        all_ready = all(last[k].date() >= expected for k in ("TQQQ", "QQQ", "VIX", "VIX3M"))
+        if all_ready:
+            sig = (round(float(df.c.iloc[-1]), 2), round(float(df.qc.iloc[-1]), 2), round(float(df.vix.iloc[-1]), 2))
             if prev == sig:
-                return df, last, True
+                return df, last, fb, True
             prev = sig
             sleep(STABLE_WAIT)
         else:
             prev = None
-            print(f"[WAIT] 야후에 {expected} 봉이 아직 없습니다(마지막 {df.index[-1].date()}). {RETRY_WAIT}초 후 재시도")
+            missing = [k for k in ("TQQQ", "QQQ", "VIX", "VIX3M") if last[k].date() < expected]
+            print(f"[WAIT] {expected} 미반영: {', '.join(missing)}. {RETRY_WAIT}초 후 재시도")
             sleep(RETRY_WAIT)
-    return df, last, False
+    return df, last, fb, False
 
 
 # ---------------- 메인 ----------------
@@ -412,32 +476,33 @@ def run(now_utc: datetime = None, force: bool = False, sleep=_time.sleep) -> int
         print(f"{expected} 은(는) 이미 처리했습니다. 종료.")
         return 0
 
-    df, last, final = fetch_final(expected, sleep=sleep)
+    df, last, fb, final = fetch_final(expected, cal, sleep=sleep)
     have_bar = df.index[-1].date() >= expected
     warnings = []
+    if fb:
+        warnings.append(f"일봉 지연으로 정규장 5분봉 마감값 사용: {', '.join(fb)}")
     if not have_bar:
         msg = f"야후에 {expected} 봉이 올라오지 않았습니다(마지막 {df.index[-1].date()})."
         if late and not force:
             raise BotError(msg)
-        print(f"[SKIP] {msg} 다음 실행에서 다시 시도합니다.")
+        print(f"[SKIP] {msg}")
         return 0
     if not final:
         if not late and not force:
-            print("[SKIP] 종가가 아직 변동 중입니다. 다음 실행에서 다시 시도합니다.")
+            print("[SKIP] 4종목 종가 확정 대기 중. 다음 실행에서 재시도.")
             return 0
-        warnings.append("종가가 아직 확정 전일 수 있습니다(야후 값이 계속 변동). 증권사 종가와 비교해 보세요.")
+        warnings.append("일부 종목 종가가 아직 확정 전일 수 있습니다.")
     stale = [k for k in ("QQQ", "VIX", "VIX3M") if last[k].date() < expected]
     if stale:
         if not late and not force:
-            print(f"[SKIP] {', '.join(stale)} 데이터가 아직 {expected} 까지 반영되지 않았습니다. 다음 실행에서 다시 시도합니다.")
+            print(f"[SKIP] {', '.join(stale)} 미반영.")
             return 0
-        warnings.append(f"{', '.join(stale)} 데이터가 아직 {expected}까지 반영되지 않아 이전 값으로 계산했습니다. DIP/GC 신호는 다시 확인하세요.")
+        warnings.append(f"{', '.join(stale)} 미반영으로 직전값 사용")
 
-    df = df[df.index <= pd.Timestamp(expected)]  # 장중 미완성 봉 등 expected 이후 데이터 제외
+    df = df[df.index <= pd.Timestamp(expected)]
     d = compute(df)
     latest = d.index[-1]
 
-    # 놓친 신호(이전 발송일 이후, 오늘 이전)
     missed = []
     if not force and state.get("last_notified"):
         start = pd.Timestamp(state["last_notified"])
@@ -446,7 +511,6 @@ def run(now_utc: datetime = None, force: bool = False, sleep=_time.sleep) -> int
     for t in missed:
         send_telegram(build_message(d.loc[:t], missed=True))
         save_state(last_notified=str(t.date()))
-        print(f"[ALERT] 놓친 신호 보충: {t.date()} {d.loc[t, 'act']}")
 
     has_signal = bool(d.act.iloc[-1])
     if mode == "signals" and not has_signal and not force and not warnings:
@@ -460,24 +524,23 @@ def run(now_utc: datetime = None, force: bool = False, sleep=_time.sleep) -> int
 
 
 def notify_error(e: Exception) -> None:
-    """마감 후 LATE_MIN 이 지난 뒤의 오류만, 하루 1회 텔레그램으로 알림."""
     if not _ctx["late"]:
         return
     st = load_state()
     if st.get("last_error_date") == _ctx["expected"]:
         return
-    send_telegram(f"⚠️ 눈덩이티큐 봇 오류 ({_ctx['expected']} 마감 기준)\n{e}\n\n"
-                  "다음 실행에서 자동으로 다시 시도하고, 놓친 신호가 있으면 보충해서 알려드립니다.")
+    send_telegram(f"⚠️ 눈덩이티큐 봇 오류 ({_ctx['expected']} 마감 기준)\n{e}")
     save_state(last_error_date=_ctx["expected"])
 
 
 if __name__ == "__main__":
     try:
         sys.exit(run(force=os.getenv("FORCE_SEND") == "1"))
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         print(f"[ERROR] {e!r}")
         try:
             notify_error(e)
-        except Exception as e2:  # noqa: BLE001
+        except Exception as e2:
             print(f"[ERROR] 오류 알림 발송 실패: {e2!r}")
         sys.exit(1)
+```
