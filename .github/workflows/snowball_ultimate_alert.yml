@@ -1,37 +1,31 @@
 name: snowball-tqqq-alert
 
 on:
-  schedule:
-    # [정규 마감일] 미국 정규장 마감(16:00 ET) 12분 / 27분 / 57분 뒤에 시도합니다.
-    #  - 서머타임(마감 20:00 UTC)과 표준시(마감 21:00 UTC) 둘 다 걸어두고,
-    #    마감 전에 도는 실행은 스크립트가 거래소 달력으로 판단해 건너뜁니다.
-    - cron: "12 20 * * 1-5"
-    - cron: "27 20 * * 1-5"
-    - cron: "57 20 * * 1-5"
-    - cron: "12 21 * * 1-5"
-    - cron: "27 21 * * 1-5"
-    - cron: "57 21 * * 1-5"
-    # [조기 마감일] 13:00 ET 마감(7월, 추수감사절 다음 날, 12월 24일 등) 12분 / 27분 뒤.
-    #  조기 마감이 있는 달(7, 11, 12월)에만 걸었고, 조기 마감일이 아니면 스크립트가 바로 종료합니다.
-    - cron: "12 17,18 * 7,11,12 1-5"
-    - cron: "27 17,18 * 7,11,12 1-5"
+  # [권장] 외부 무료 크론(cron-job.org)에서 한국시간 화~토 06:10(또는 05:10 EDT)에
+  # GitHub workflow_dispatch API를 호출하면 GitHub schedule 지연 없이 즉시 실행됩니다.
   workflow_dispatch:
     inputs:
       force_send:
-        description: "1이면 마감/중복 확인 없이 가장 최근 봉으로 지금 바로 발송 (테스트용, 기록은 저장 안 함)"
+        description: "1이면 마감/중복 확인 없이 가장 최근 봉으로 지금 바로 발송"
         default: "0"
+
+  # [백업용 schedule] 외부 크론을 안 쓸 경우를 대비한 최소 백업 (중복 줄 세우기 최소화)
+  schedule:
+    - cron: "11 20 * * 1-5" # EDT 16:11 (한국 05:11)
+    - cron: "11 21 * * 1-5" # EST 16:11 (한국 06:11)
+    - cron: "11 17,18 * 7,11,12 1-5" # 조기 마감일 백업
 
 permissions:
   contents: write
 
 concurrency:
   group: snowball-alert
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   alert:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -46,12 +40,13 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          NOTIFY_MODE: always        # signals 로 바꾸면 신호가 난 날만 발송
-          RSI_MODE: 표대로            # 끄기 | 축소형 | 표대로 (TradingView 지표 모드와 동일하게)
+          NOTIFY_MODE: always
+          RSI_MODE: 표대로
+          MANUAL_STAGE: "1"      # 실제 계좌 Stage (수동 매도 후 Stage 1 유지)
+          MANUAL_SHARES: "0"     # 실제 보유 주수 (수동 전량 매도 상태)
           FORCE_SEND: ${{ github.event.inputs.force_send }}
         run: python snowball_bot.py
 
-      # 위 단계가 실패해도(오류 알림 기록 등) 상태 파일은 저장합니다.
       - name: 발송 기록 저장
         if: always()
         run: |
