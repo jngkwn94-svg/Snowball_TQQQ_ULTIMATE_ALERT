@@ -41,7 +41,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           NOTIFY_MODE: always
-          RSI_MODE: 표대로
+          RSI_MODE: 축소형
           MANUAL_STAGE: "1"      # 실제 계좌 Stage (수동 매도 후 Stage 1 유지)
           MANUAL_SHARES: "0"     # 실제 보유 주수 (수동 전량 매도 상태)
           FORCE_SEND: ${{ github.event.inputs.force_send }}
