@@ -5,15 +5,15 @@
 개선 사항
 1. fetch_final()에서 TQQQ뿐만 아니라 QQQ, ^VIX, ^VIX3M 4개 종목 모두 당일 봉이 올라올 때까지 대기
 2. 야후 1d 일봉 반영이 지연될 경우, 당일 정규장(09:30~마감시각 ET) 5분봉으로 종가/고가를 보완
-3. 수동 매매 상태(MANUAL_OVERRIDE=1 또는 state/manual_position.json) 반영 가능
-4. 가독성 개선형 텔레그램 요약(다음 신호까지 남은 거리 명시)
+3. 수동 매매 상태(MANUAL_STAGE / MANUAL_SHARES) 반영 가능
+4. 가독성 개선형 텔레그램 요약(다음 신호까지 남은 거리 및 RSI_MODE 목표 비중 명시)
 
 필요한 환경변수: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 선택 환경변수:
   NOTIFY_MODE = always(기본) | signals
   RSI_MODE    = 끄기 | 축소형 | 표대로(기본)
   FORCE_SEND  = 1 (테스트용, 기록 저장 안 함)
-  MANUAL_STAGE = 1 / MANUAL_SHARES = 0 / MANUAL_RECH = 1 (실제 계좌 상태 덮어쓰기)
+  MANUAL_STAGE = 1 / MANUAL_SHARES = 0 (실제 계좌 상태 덮어쓰기)
 """
 import json
 import os
@@ -41,15 +41,15 @@ STATE_PATH = os.path.join("state", "last_notified.json")
 HISTORY_START = "2009-01-01"
 
 # 타이밍 설정 (외부 정각 크론 연동에 맞춰 빠른 재시도)
-BUFFER_MIN = 8       # 마감 후 이 시간(분)이 지나야 종가 확정으로 봄
-LATE_MIN = 45        # 마감 후 이 시간(분)이 지나도 못 보내면 경고/불완전 데이터로 발송
-MAX_TRIES = 10       # 한 번 실행 안에서 야후 조회 재시도 횟수
-RETRY_WAIT = 30      # 봉이 아직 없을 때 대기(초)
-STABLE_WAIT = 20     # 종가 안정 확인 사이 대기(초)
+BUFFER_MIN = 8
+LATE_MIN = 45
+MAX_TRIES = 10
+RETRY_WAIT = 30
+STABLE_WAIT = 20
 CATCHUP_MAX_BARS = 40
 
 # RSI 보너스
-RSI_MODE = os.getenv("RSI_MODE", "표대로")
+RSI_MODE = os.getenv("RSI_MODE", "축소형")
 RSI_LEN = 14
 RSI_MID = 35.0
 RSI_EXTREME = 30.0
@@ -57,8 +57,8 @@ DIP1_BASE_W = 30.0
 DIP2_BASE_W = 70.0
 BONUS_TABLE = {"끄기": (0.0, 0.0), "축소형": (5.0, 7.5), "표대로": (10.0, 15.0)}
 if RSI_MODE not in BONUS_TABLE:
-    print(f"[WARN] RSI_MODE='{RSI_MODE}' 잘못된 값 -> '표대로'로 대체")
-    RSI_MODE = "표대로"
+    print(f"[WARN] RSI_MODE='{RSI_MODE}' 잘못된 값 -> '축소형'으로 대체")
+    RSI_MODE = "축소형"
 
 _ctx = {"late": False, "expected": None}
 
@@ -139,7 +139,6 @@ def _intraday_regular_bar(ticker: str, target_date: date, close_et: time):
         day_df = day_df[(day_df.index.time >= time(9, 30)) & (day_df.index.time <= close_et)]
         if day_df.empty:
             return None
-        # 마감 10분 이내 봉이 있으면 정규장 마감 데이터로 인정
         last_t = day_df.index[-1].time()
         cutoff = (datetime.combine(target_date, close_et) - timedelta(minutes=10)).time()
         if last_t < cutoff:
@@ -338,13 +337,11 @@ def build_message(d: pd.DataFrame, missed: bool = False, warnings=None) -> str:
     kst_now = datetime.now(KST).strftime("%m-%d %H:%M")
     dt_str = d.index[-1].strftime("%Y-%m-%d")
 
-    # 수동 계좌 상태 오버라이드 확인
     manual_stage = os.getenv("MANUAL_STAGE")
     manual_shares = os.getenv("MANUAL_SHARES")
     eff_stage = int(manual_stage) if manual_stage is not None and manual_stage.isdigit() else int(r.stage)
-    shares_txt = f"{manual_shares}주 (수동)" if manual_shares is not None else f"전략추적({STAGE_TXT[eff_stage]})"
+    shares_txt = f"{manual_shares}주(수동)" if manual_shares is not None else STAGE_TXT[eff_stage]
 
-    # 상단 핵심 요약(무엇이 얼마나 남았는지 명시)
     if r.act:
         emo, name, what = ACTION_TXT[r.act]
         if r.act in ("DIP1", "DIP2"):
@@ -360,35 +357,39 @@ def build_message(d: pd.DataFrame, missed: bool = False, warnings=None) -> str:
     else:
         summary = f"유지 · {STAGE_TXT[eff_stage]}"
 
-    head = f"⚠️ 놓친 신호 · {dt_str} 마감" if missed else f"❄️ 눈덩이 티큐 일일 점검"
+    head = f"⚠️ 놓친 신호 · {dt_str} 마감" if missed else "❄️ 눈덩이 티큐 일일 점검"
     lines = [
         head,
-        f"{dt_str} 미국장 마감 (KST {kst_now}) · {summary}",
+        f"🗓️ {dt_str} 미국장 마감 (KST {kst_now})",
+        f"📌 {summary}",
         "",
-        f"📊 현황 (Stage {eff_stage} · 보유 {shares_txt})",
-        f"• TQQQ: ${fmt(r.c)} ({fmt(chg_t, 2, True)})",
-        f"• QQQ: ${fmt(r.qc)} ({fmt(chg_q, 2, True)}) · 낙폭 {fmt(r.dd, 2, True)}",
-        f"• RSI(14): {fmt(r.rsi, 1)} · VIX비율: {fmt(r.vr)} (DIP1 기준 {fmt(r.trig, 0, True)})",
-        f"• Z200: {fmt(r.z200, 2, True)} · GC Gap: {fmt(r.gap * 100, 2, True)}",
+        f"📊 현황 [Stage {eff_stage} · {shares_txt} · {RSI_MODE}]",
+        f"  TQQQ : ${fmt(r.c)} ({fmt(chg_t, 2, True)})",
+        f"  QQQ  : ${fmt(r.qc)} ({fmt(chg_q, 2, True)}) · 낙폭 {fmt(r.dd, 2, True)}",
+        f"  RSI  : {fmt(r.rsi, 1)} (목표 DIP1 {wtxt(r.dip1_t)} / DIP2 {wtxt(r.dip2_t)})",
+        f"  VIX비: {fmt(r.vr)} (DIP1 기준 {fmt(r.trig, 0, True)})",
+        f"  이격 : Z200 {fmt(r.z200, 2, True)} · GC Gap {fmt(r.gap * 100, 2, True)}",
         "",
         "✅ 조건 점검",
     ]
 
     if eff_stage == 0:
         dd_ok = r.dd <= r.trig
-        lines.append(f"• {'🟢' if dd_ok else '🔴'} DIP1 (QQQ ≤ {fmt(r.trig, 0, True)}): {fmt(r.dd, 2, True)}" + ("" if dd_ok else f" ({r.dd - r.trig:.2f}%p 남음)"))
+        lines.append(f"  {'🟢' if dd_ok else '🔴'} DIP1 (QQQ ≤ {fmt(r.trig, 0, True)}): {fmt(r.dd, 2, True)}" + ("" if dd_ok else f" ({r.dd - r.trig:.2f}%p 남음)"))
     elif eff_stage == 1:
         d2_ok = r.dd <= P["dip2"]
         z_ok = r.z200 <= P["dip2_z200_max"]
-        lines.append(f"• {'🟢' if d2_ok else '🔴'} DIP2 낙폭 (QQQ ≤ -22%): {fmt(r.dd, 2, True)}" + ("" if d2_ok else f" (QQQ DD {r.dd - P['dip2']:.2f}%p 남음)"))
-        lines.append(f"• {'🟢' if z_ok else '🔴'} DIP2 Z200 (≤ -7%): {fmt(r.z200, 2, True)}")
+        lines.append(f"  {'🟢' if d2_ok else '🟡' if (r.dd - P['dip2']) <= 3.0 else '🔴'} DIP2 낙폭 (≤ -22%): {fmt(r.dd, 2, True)}" + ("" if d2_ok else f" (QQQ DD {r.dd - P['dip2']:.2f}%p 남음)"))
+        lines.append(f"  {'🟢' if z_ok else '🔴'} DIP2 Z200 (≤ -7%): {fmt(r.z200, 2, True)}")
     if eff_stage >= 1 and not np.isnan(r.avg) and manual_shares != "0":
-        lines.append(f"• 전략 평단 ${fmt(r.avg)} (수익률 {fmt((r.c / r.avg - 1) * 100, 2, True)})")
+        lines.append(f"  📌 전략 평단 ${fmt(r.avg)} ({fmt((r.c / r.avg - 1) * 100, 2, True)})")
 
     lines += ["", f"🎯 행동: {summary}"]
     if r.act in ("DIP1", "DIP2"):
         tgt = r.dip1_t if r.act == "DIP1" else r.dip2_t
-        lines.append(f"   → RSI {fmt(r.rsi, 1)} ({RSI_MODE}) 적용 목표 비중 {wtxt(tgt)}")
+        lines.append(f"  → RSI {fmt(r.rsi, 1)} ({RSI_MODE}) 기준 목표 비중 {wtxt(tgt)}")
+    elif eff_stage == 1 and not r.act:
+        lines.append(f"  → 도달 시 목표 비중 {wtxt(r.dip2_t)} ({RSI_MODE} 기준)")
 
     for w in (warnings or []):
         lines.append(f"⚠️ {w}")
