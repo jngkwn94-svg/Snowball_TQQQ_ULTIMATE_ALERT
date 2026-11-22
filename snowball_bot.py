@@ -384,12 +384,47 @@ def build_message(d: pd.DataFrame, missed: bool = False, warnings=None) -> str:
     if eff_stage >= 1 and not np.isnan(r.avg) and manual_shares != "0":
         lines.append(f"  📌 전략 평단 ${fmt(r.avg)} ({fmt((r.c / r.avg - 1) * 100, 2, True)})")
 
-    lines += ["", f"🎯 행동: {summary}"]
-    if r.act in ("DIP1", "DIP2"):
-        tgt = r.dip1_t if r.act == "DIP1" else r.dip2_t
-        lines.append(f"  → RSI {fmt(r.rsi, 1)} ({RSI_MODE}) 기준 목표 비중 {wtxt(tgt)}")
-    elif eff_stage == 1 and not r.act:
-        lines.append(f"  → 도달 시 목표 비중 {wtxt(r.dip2_t)} ({RSI_MODE} 기준)")
+    if r.act:
+        emo, name, what = ACTION_TXT[r.act]
+        if r.act in ("DIP1", "DIP2"):
+            tgt = r.dip1_t if r.act == "DIP1" else r.dip2_t
+            what = f"전체 자산 {wtxt(tgt)}까지 매수 ({RSI_MODE})"
+        today_todo = f"{emo} {name} 실행 → {what}"
+    else:
+        today_todo = "매매 없음 (관망 · 대기)"
+
+    lines += ["", f"🎯 오늘 할 일: {today_todo}"]
+
+    # 다음 단계 기준가 및 임박 시 행동 안내
+    next_guides = []
+    if eff_stage == 0 and not np.isnan(r.qh):
+        d1_px = r.qh * (1.0 + r.trig / 100.0)
+        d1_pct = (d1_px / r.qc - 1.0) * 100.0
+        tag = "🚨 임박! " if (r.dd - r.trig) <= 3.0 else ""
+        next_guides.append(
+            f"  {tag}QQQ ${d1_px:.2f} 이하 마감 시(현재가 대비 {d1_pct:+.2f}%) → DIP1 매수 (목표 {wtxt(r.dip1_t)})"
+        )
+    elif eff_stage == 1 and not np.isnan(r.qh):
+        d2_px = r.qh * (1.0 + P["dip2"] / 100.0)
+        d2_pct = (d2_px / r.qc - 1.0) * 100.0
+        tag = "🚨 임박! " if (r.dd - P["dip2"]) <= 3.0 else ""
+        z_note = "Z200 조건 충족됨" if r.z200 <= P["dip2_z200_max"] else f"TQQQ ${r.ma200 * 0.93:.2f} 이하 동시 충족 필요"
+        next_guides.append(
+            f"  {tag}QQQ ${d2_px:.2f} 이하 마감 시(현재가 대비 {d2_pct:+.2f}%) → DIP2 매수 (예상 목표 {wtxt(r.dip2_t)}, {z_note})"
+        )
+    elif eff_stage >= 2:
+        if not np.isnan(r.avg) and manual_shares != "0":
+            if not r.t1:
+                tp1_px = r.avg * (1.0 + P["tp1"] / 100.0)
+                next_guides.append(f"  TQQQ ${tp1_px:.2f} 이상 마감 시 → TP1 (보유 50% 매도)")
+            elif not r.t2:
+                tp2_px = r.avg * (1.0 + P["tp2"] / 100.0)
+                next_guides.append(f"  TQQQ ${tp2_px:.2f} 이상 마감 시 → TP2 (보유 35% 매도)")
+        if r.gap * 100.0 < 1.5:
+            next_guides.append(f"  ⚠️ 5/220MA 갭 {fmt(r.gap * 100, 2, True)} → -0.10% 하향 돌파 시 DC 전량 매도")
+
+    if next_guides:
+        lines += ["🔔 다음 단계 대비", *next_guides]
 
     for w in (warnings or []):
         lines.append(f"⚠️ {w}")
