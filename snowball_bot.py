@@ -339,7 +339,13 @@ def build_message(d: pd.DataFrame, missed: bool = False, warnings=None) -> str:
 
     manual_stage = os.getenv("MANUAL_STAGE")
     manual_shares = os.getenv("MANUAL_SHARES")
+    manual_avg = os.getenv("MANUAL_AVG")
     eff_stage = int(manual_stage) if manual_stage is not None and manual_stage.isdigit() else int(r.stage)
+    try:
+        eff_avg = float(manual_avg) if manual_avg is not None and float(manual_avg) > 0 else float(r.avg)
+    except ValueError:
+        eff_avg = float(r.avg)
+    avg_label = "실제 평단" if manual_avg is not None else "전략 평단"
     shares_txt = f"{manual_shares}주(수동)" if manual_shares is not None else STAGE_TXT[eff_stage]
 
     if r.act:
@@ -381,8 +387,13 @@ def build_message(d: pd.DataFrame, missed: bool = False, warnings=None) -> str:
         z_ok = r.z200 <= P["dip2_z200_max"]
         lines.append(f"  {'🟢' if d2_ok else '🟡' if (r.dd - P['dip2']) <= 3.0 else '🔴'} DIP2 낙폭 (≤ -22%): {fmt(r.dd, 2, True)}" + ("" if d2_ok else f" (QQQ DD {r.dd - P['dip2']:.2f}%p 남음)"))
         lines.append(f"  {'🟢' if z_ok else '🔴'} DIP2 Z200 (≤ -7%): {fmt(r.z200, 2, True)}")
-    if eff_stage >= 1 and not np.isnan(r.avg) and manual_shares != "0":
-        lines.append(f"  📌 전략 평단 ${fmt(r.avg)} ({fmt((r.c / r.avg - 1) * 100, 2, True)})")
+    if eff_stage >= 1 and not np.isnan(eff_avg) and manual_shares != "0":
+        tp_next = ""
+        if not r.t1:
+            tp_next = f" · TP1 ${eff_avg * (1.0 + P['tp1'] / 100.0):.2f}"
+        elif not r.t2:
+            tp_next = f" · TP2 ${eff_avg * (1.0 + P['tp2'] / 100.0):.2f}"
+        lines.append(f"  📌 {avg_label} ${fmt(eff_avg)} ({fmt((r.c / eff_avg - 1) * 100, 2, True)}){tp_next}")
 
     if r.act:
         emo, name, what = ACTION_TXT[r.act]
@@ -412,13 +423,18 @@ def build_message(d: pd.DataFrame, missed: bool = False, warnings=None) -> str:
         next_guides.append(
             f"  {tag}QQQ ${d2_px:.2f} 이하 마감 시(현재가 대비 {d2_pct:+.2f}%) → DIP2 매수 (예상 목표 {wtxt(r.dip2_t)}, {z_note})"
         )
-    elif eff_stage >= 2:
-        if not np.isnan(r.avg) and manual_shares != "0":
+        if not np.isnan(eff_avg) and manual_shares != "0":
             if not r.t1:
-                tp1_px = r.avg * (1.0 + P["tp1"] / 100.0)
+                next_guides.append(f"  TQQQ ${eff_avg * (1.0 + P['tp1'] / 100.0):.2f} 이상 마감 시 → TP1 (보유 50% 매도)")
+            elif not r.t2:
+                next_guides.append(f"  TQQQ ${eff_avg * (1.0 + P['tp2'] / 100.0):.2f} 이상 마감 시 → TP2 (보유 35% 매도)")
+    elif eff_stage >= 2:
+        if not np.isnan(eff_avg) and manual_shares != "0":
+            if not r.t1:
+                tp1_px = eff_avg * (1.0 + P["tp1"] / 100.0)
                 next_guides.append(f"  TQQQ ${tp1_px:.2f} 이상 마감 시 → TP1 (보유 50% 매도)")
             elif not r.t2:
-                tp2_px = r.avg * (1.0 + P["tp2"] / 100.0)
+                tp2_px = eff_avg * (1.0 + P["tp2"] / 100.0)
                 next_guides.append(f"  TQQQ ${tp2_px:.2f} 이상 마감 시 → TP2 (보유 35% 매도)")
         if r.gap * 100.0 < 1.5:
             next_guides.append(f"  ⚠️ 5/220MA 갭 {fmt(r.gap * 100, 2, True)} → -0.10% 하향 돌파 시 DC 전량 매도")
