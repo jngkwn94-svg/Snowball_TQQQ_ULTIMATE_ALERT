@@ -306,7 +306,7 @@ def compute(df: pd.DataFrame, p: dict = P, mode: str = None) -> pd.DataFrame:
 
 
 # ---------------- 메시지 ----------------
-STAGE_TXT = {0: "현금 대기", 1: "DIP1", 2: "DIP2", 3: "GC 보유"}
+STAGE_TXT = {0: "현금 대기", 1: "DIP1 1차매수", 2: "DIP2 2차매수", 3: "GC 풀매수"}
 ACTION_TXT = {
     "DC": ("🔴", "DC", "전량 매도"),
     "TP3": ("🔴", "TP3", "전량 매도 후 LOCK"),
@@ -340,7 +340,14 @@ def build_message(d: pd.DataFrame, missed: bool = False, warnings=None) -> str:
     manual_stage = os.getenv("MANUAL_STAGE")
     manual_shares = os.getenv("MANUAL_SHARES")
     eff_stage = int(manual_stage) if manual_stage is not None and manual_stage.isdigit() else int(r.stage)
-    shares_txt = f"{manual_shares}주 (수동)" if manual_shares is not None else f"전략추적({STAGE_TXT[eff_stage]})"
+    cur_w = wtxt(r.w * 100) if r.w > 0 else (wtxt(r.dip1_t) if eff_stage == 1 else wtxt(r.dip2_t))
+    stage_info = {
+        0: "TQQQ 0% · DC/TP3 후 현금 관망",
+        1: f"TQQQ {cur_w} · QQQ -10%~-14% 1차 매수",
+        2: f"TQQQ {cur_w} · QQQ ≤-22% 2차 매수",
+        3: "TQQQ 100% · 5MA≥220MA+3.5% 상승추세",
+    }
+    shares_txt = f" · 수동 {manual_shares}주" if manual_shares is not None else ""
 
     if r.act:
         emo, name, what = ACTION_TXT[r.act]
@@ -362,7 +369,7 @@ def build_message(d: pd.DataFrame, missed: bool = False, warnings=None) -> str:
         head,
         f"{dt_str} 미국장 마감 (KST {kst_now}) · {summary}",
         "",
-        f"📊 현황 (Stage {eff_stage} · 보유 {shares_txt})",
+        f"📊 현황: {STAGE_TXT[eff_stage]} ({stage_info[eff_stage]}{shares_txt})",
         f"• TQQQ: ${fmt(r.c)} ({fmt(chg_t, 2, True)})",
         f"• QQQ: ${fmt(r.qc)} ({fmt(chg_q, 2, True)}) · 낙폭 {fmt(r.dd, 2, True)}",
         f"• RSI(14): {fmt(r.rsi, 1)} · VIX비율: {fmt(r.vr)} (DIP1 기준 {fmt(r.trig, 0, True)})",
