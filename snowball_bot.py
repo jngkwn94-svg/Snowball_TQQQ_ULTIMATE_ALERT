@@ -5,17 +5,16 @@
 개선 사항
 1. fetch_final()에서 TQQQ뿐만 아니라 QQQ, ^VIX, ^VIX3M 4개 종목 모두 당일 봉이 올라올 때까지 대기
 2. 야후 1d 일봉 반영이 지연될 경우, 당일 정규장(09:30~마감시각 ET) 5분봉으로 종가/고가를 보완
-3. 수동 매매 상태(MANUAL_STAGE / MANUAL_SHARES) 반영 가능
-4. 가독성 개선형 텔레그램 요약(다음 신호까지 남은 거리 및 RSI_MODE 목표 비중 명시)
+3. 수동 매매 상태(MANUAL_OVERRIDE=1 또는 state/manual_position.json) 반영 가능
+4. 가독성 개선형 텔레그램 요약(다음 신호까지 남은 거리 명시)
 
 필요한 환경변수: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 선택 환경변수:
   NOTIFY_MODE = always(기본) | signals
-  RSI_MODE    = 끄기 | 축소형 | 표대로(기본)
+  RSI_MODE    = 끄기 | 축소형(기본) | 표대로
   FORCE_SEND  = 1 (테스트용, 기록 저장 안 함)
-  MANUAL_STAGE = 1 / MANUAL_SHARES = 0 (실제 계좌 상태 덮어쓰기)
+  MANUAL_STAGE = 1 / MANUAL_SHARES = 0 / MANUAL_RECH = 1 (실제 계좌 상태 덮어쓰기)
 """
-import html
 import json
 import os
 import sys
@@ -29,7 +28,7 @@ import pandas as pd
 # ---------------- 파라미터 (TradingView 지표 입력값과 동일) ----------------
 P = dict(
     ma5=5, ma220=220, ma200=200,
-    gc_pct=2.90, dc_pct=-0.10,
+    gc_pct=3.50, dc_pct=-0.10,
     dip_lookback=126,
     dip1_base=-10.0, dip1_vix=-12.0, dip1_extreme=-14.0,
     dip2=-22.0, dip2_z200_max=-7.0, max_dip=-40.0,
@@ -42,11 +41,11 @@ STATE_PATH = os.path.join("state", "last_notified.json")
 HISTORY_START = "2009-01-01"
 
 # 타이밍 설정 (외부 정각 크론 연동에 맞춰 빠른 재시도)
-BUFFER_MIN = 8
-LATE_MIN = 45
-MAX_TRIES = 10
-RETRY_WAIT = 30
-STABLE_WAIT = 20
+BUFFER_MIN = 8       # 마감 후 이 시간(분)이 지나야 종가 확정으로 봄
+LATE_MIN = 45        # 마감 후 이 시간(분)이 지나도 못 보내면 경고/불완전 데이터로 발송
+MAX_TRIES = 10       # 한 번 실행 안에서 야후 조회 재시도 횟수
+RETRY_WAIT = 30      # 봉이 아직 없을 때 대기(초)
+STABLE_WAIT = 20     # 종가 안정 확인 사이 대기(초)
 CATCHUP_MAX_BARS = 40
 
 # RSI 보너스
@@ -335,77 +334,61 @@ def build_message(d: pd.DataFrame, missed: bool = False, warnings=None) -> str:
     prev_qqq = d.qc.iloc[-2] if len(d) > 1 else np.nan
     chg_t = (r.c / prev_tqqq - 1) * 100 if not np.isnan(prev_tqqq) else np.nan
     chg_q = (r.qc / prev_qqq - 1) * 100 if not np.isnan(prev_qqq) else np.nan
-    dt_str = d.index[-1].strftime("%m-%d")
+    kst_now = datetime.now(KST).strftime("%m-%d %H:%M")
+    dt_str = d.index[-1].strftime("%Y-%m-%d")
 
     manual_stage = os.getenv("MANUAL_STAGE")
     manual_shares = os.getenv("MANUAL_SHARES")
-    manual_avg = os.getenv("MANUAL_AVG")
     eff_stage = int(manual_stage) if manual_stage is not None and manual_stage.isdigit() else int(r.stage)
-    try:
-        eff_avg = float(manual_avg) if manual_avg is not None and float(manual_avg) > 0 else float(r.avg)
-    except ValueError:
-        eff_avg = float(r.avg)
+    shares_txt = f"{manual_shares}주 (수동)" if manual_shares is not None else f"전략추적({STAGE_TXT[eff_stage]})"
 
-    # 1. 잠결에도 1초 만에 보이는 최상단 배너
-    if missed:
-        banner = f"⚠️ <b>[놓친 신호 · {dt_str}] {r.act}</b>"
-    elif r.act in ("DIP1", "DIP2"):
-        tgt = r.dip1_t if r.act == "DIP1" else r.dip2_t
-        banner = f"🟢🟢 <b>[매수] {r.act} — 자산 {wtxt(tgt)}까지 매수!</b>"
-    elif r.act == "GC":
-        banner = "🟢🟢 <b>[매수] GC 돌파 — 자산 100%까지 매수!</b>"
-    elif r.act in ("TP1", "TP2"):
-        pct_sell = P["tp1_sell"] if r.act == "TP1" else P["tp2_sell"]
-        banner = f"🟡🟡 <b>[익절] {r.act} — 보유 {pct_sell}% 매도!</b>"
-    elif r.act in ("DC", "TP3"):
-        banner = f"🔴🔴 <b>[전량 매도] {r.act} 발동!</b>"
+    if r.act:
+        emo, name, what = ACTION_TXT[r.act]
+        if r.act in ("DIP1", "DIP2"):
+            tgt = r.dip1_t if r.act == "DIP1" else r.dip2_t
+            what = f"전체 자산 {wtxt(tgt)}까지 매수"
+        summary = f"{emo} {name} 발동 · {what}"
+    elif eff_stage == 0:
+        dist = r.dd - r.trig
+        summary = f"대기 · DIP1까지 QQQ DD {abs(dist):.2f}%p 남음" if dist > 0 else "대기 · DIP1 조건 충족(재확인 대기)"
+    elif eff_stage == 1:
+        dist = r.dd - P["dip2"]
+        summary = f"대기 · DIP2까지 QQQ DD {dist:.2f}%p 남음" if dist > 0 else "대기 · DIP2 낙폭 충족(Z200/재확인 확인)"
     else:
-        banner = "⏸️ <b>오늘은 매매 없음 (대기)</b>"
+        summary = f"유지 · {STAGE_TXT[eff_stage]}"
 
+    head = f"⚠️ 놓친 신호 · {dt_str} 마감" if missed else f"❄️ 눈덩이 티큐 일일 점검"
     lines = [
-        banner,
-        f"🗓️ {dt_str} 미국장 마감 · Stage {eff_stage} ({STAGE_TXT[eff_stage]}) · {RSI_MODE}",
+        head,
+        f"{dt_str} 미국장 마감 (KST {kst_now}) · {summary}",
         "",
+        f"📊 현황 (Stage {eff_stage} · 보유 {shares_txt})",
+        f"• TQQQ: ${fmt(r.c)} ({fmt(chg_t, 2, True)})",
+        f"• QQQ: ${fmt(r.qc)} ({fmt(chg_q, 2, True)}) · 낙폭 {fmt(r.dd, 2, True)}",
+        f"• RSI(14): {fmt(r.rsi, 1)} · VIX비율: {fmt(r.vr)} (DIP1 기준 {fmt(r.trig, 0, True)})",
+        f"• Z200: {fmt(r.z200, 2, True)} · GC Gap: {fmt(r.gap * 100, 2, True)}",
+        "",
+        "✅ 조건 점검",
     ]
 
-    # 2. 다음 단계 기준가 / 임박 알림 (가장 중요한 행동 기준)
-    next_guides = []
-    if eff_stage == 0 and not np.isnan(r.qh):
-        d1_px = r.qh * (1.0 + r.trig / 100.0)
-        d1_pct = (d1_px / r.qc - 1.0) * 100.0
-        tag = "🚨 <b>임박!</b> " if (r.dd - r.trig) <= 3.0 else ""
-        next_guides.append(f"• {tag}QQQ <b>${d1_px:.2f}</b> 이하 ({d1_pct:+.2f}%) → DIP1 <b>{wtxt(r.dip1_t)}</b>")
-    elif eff_stage == 1 and not np.isnan(r.qh):
-        d2_px = r.qh * (1.0 + P["dip2"] / 100.0)
-        d2_pct = (d2_px / r.qc - 1.0) * 100.0
-        tag = "🚨 <b>임박!</b> " if (r.dd - P["dip2"]) <= 3.0 else ""
-        next_guides.append(f"• {tag}QQQ <b>${d2_px:.2f}</b> 이하 ({d2_pct:+.2f}%) → DIP2 <b>{wtxt(r.dip2_t)}</b>")
-        if r.z200 > P["dip2_z200_max"] and not np.isnan(r.ma200):
-            next_guides.append(f"  (TQQQ ${r.ma200 * 0.93:.2f} 이하 동시 필요)")
-    if eff_stage >= 1 and not np.isnan(eff_avg) and manual_shares != "0":
-        if not r.t1:
-            next_guides.append(f"• TQQQ <b>${eff_avg * (1.0 + P['tp1'] / 100.0):.2f}</b> 이상 → TP1 (50% 매도)")
-        elif not r.t2:
-            next_guides.append(f"• TQQQ <b>${eff_avg * (1.0 + P['tp2'] / 100.0):.2f}</b> 이상 → TP2 (35% 매도)")
-    if eff_stage >= 1 and r.gap * 100.0 < 1.5:
-        next_guides.append(f"• ⚠️ 5/220MA 갭 {fmt(r.gap * 100, 2, True)} (-0.10% 시 DC)")
+    if eff_stage == 0:
+        dd_ok = r.dd <= r.trig
+        lines.append(f"• {'🟢' if dd_ok else '🔴'} DIP1 (QQQ ≤ {fmt(r.trig, 0, True)}): {fmt(r.dd, 2, True)}" + ("" if dd_ok else f" ({r.dd - r.trig:.2f}%p 남음)"))
+    elif eff_stage == 1:
+        d2_ok = r.dd <= P["dip2"]
+        z_ok = r.z200 <= P["dip2_z200_max"]
+        lines.append(f"• {'🟢' if d2_ok else '🔴'} DIP2 낙폭 (QQQ ≤ -22%): {fmt(r.dd, 2, True)}" + ("" if d2_ok else f" (QQQ DD {r.dd - P['dip2']:.2f}%p 남음)"))
+        lines.append(f"• {'🟢' if z_ok else '🔴'} DIP2 Z200 (≤ -7%): {fmt(r.z200, 2, True)}")
+    if eff_stage >= 1 and not np.isnan(r.avg) and manual_shares != "0":
+        lines.append(f"• 전략 평단 ${fmt(r.avg)} (수익률 {fmt((r.c / r.avg - 1) * 100, 2, True)})")
 
-    if next_guides:
-        lines += ["🔔 <b>다음 기준가</b>", *next_guides, ""]
-
-    # 3. 한눈에 들어오는 짧은 수치 (모바일 줄바꿈 방지)
-    lines += [
-        "──────────",
-        f"• <b>TQQQ</b> ${fmt(r.c)} ({fmt(chg_t, 2, True)})",
-        f"• <b>QQQ</b> ${fmt(r.qc)} ({fmt(chg_q, 2, True)}) | DD <b>{fmt(r.dd, 2, True)}</b>",
-        f"• <b>RSI</b> {fmt(r.rsi, 1)} | <b>VIX비</b> {fmt(r.vr)} ({fmt(r.trig, 0, True)})",
-        f"• <b>Z200</b> {fmt(r.z200, 2, True)} | <b>GC</b> {fmt(r.gap * 100, 2, True)}",
-    ]
-    if eff_stage >= 1 and not np.isnan(eff_avg) and manual_shares != "0":
-        lines.append(f"• <b>전략평단</b> ${fmt(eff_avg)} ({fmt((r.c / eff_avg - 1) * 100, 2, True)})")
+    lines += ["", f"🎯 행동: {summary}"]
+    if r.act in ("DIP1", "DIP2"):
+        tgt = r.dip1_t if r.act == "DIP1" else r.dip2_t
+        lines.append(f"   → RSI {fmt(r.rsi, 1)} ({RSI_MODE}) 적용 목표 비중 {wtxt(tgt)}")
 
     for w in (warnings or []):
-        lines.append(f"⚠️ {html.escape(str(w))}")
+        lines.append(f"⚠️ {w}")
     return "\n".join(lines)
 
 
@@ -416,7 +399,7 @@ def send_telegram(text: str) -> None:
     for k in range(4):
         try:
             resp = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                                 json={"chat_id": chat, "text": text, "parse_mode": "HTML"}, timeout=20)
+                                 json={"chat_id": chat, "text": text}, timeout=20)
             if resp.status_code == 200:
                 return
             err = f"{resp.status_code} {resp.text[:200]}"
