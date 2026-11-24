@@ -42,10 +42,12 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           NOTIFY_MODE: always
           RSI_MODE: 축소형
-          MANUAL_STAGE: "1"      # 현재 계좌 Stage (DIP1 보유 중)
-          MANUAL_SHARES: "304"   # 현재 실제 보유 주수 (추가 매수 시 수정 또는 삭제)
+          MANUAL_STAGE: "1"
+          MANUAL_SHARES: "557"
+          MANUAL_AVG: "52.52"
           FORCE_SEND: ${{ github.event.inputs.force_send }}
         run: python snowball_bot.py
+
 
       - name: 발송 기록 저장
         if: always()
