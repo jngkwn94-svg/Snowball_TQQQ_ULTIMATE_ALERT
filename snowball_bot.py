@@ -355,9 +355,9 @@ def build_message(d: pd.DataFrame, missed: bool = False, warnings=None) -> str:
     if has_manual_avg and not eff_t1 and not eff_act and eff_stage >= 1 and r.c >= eff_avg * (1.0 + P["tp1"] / 100.0):
         eff_act = "TP1"
 
-    # 1. 잠결에도 1초 만에 보이는 최상단 배너
+    # 1. 최상단 결론 배너
     if missed:
-        banner = f"⚠️ <b>[놓친 신호 · {dt_str}] {r.act}</b>"
+        banner = f"⚠️ <b>[놓친 신호 · {dt_str}] {eff_act}</b>"
     elif eff_act in ("DIP1", "DIP2"):
         tgt = r.dip1_t if eff_act == "DIP1" else r.dip2_t
         banner = f"🟢🟢 <b>[매수] {eff_act} — 자산 {wtxt(tgt)}까지 매수!</b>"
@@ -373,48 +373,56 @@ def build_message(d: pd.DataFrame, missed: bool = False, warnings=None) -> str:
 
     lines = [
         banner,
-        f"🗓️ {dt_str} 미국장 마감 · Stage {eff_stage} ({STAGE_TXT[eff_stage]}) · {RSI_MODE}",
+        f"🗓️ {dt_str} 마감 · Stage {eff_stage} ({STAGE_TXT[eff_stage]}) · {RSI_MODE}",
         "",
     ]
 
-    # 2. 다음 단계 기준가 / 임박 알림 (가장 중요한 행동 기준)
+    # 2. 다음 행동 기준가 (의미 있는 조건만 깔끔하게 표시)
     next_guides = []
     if eff_stage == 0 and not np.isnan(r.qh):
         d1_px = r.qh * (1.0 + r.trig / 100.0)
         d1_pct = (d1_px / r.qc - 1.0) * 100.0
         tag = "🚨 <b>임박!</b> " if (r.dd - r.trig) <= 3.0 else ""
-        next_guides.append(f"• {tag}QQQ <b>${d1_px:.2f}</b> 이하 ({d1_pct:+.2f}%) → DIP1 <b>{wtxt(r.dip1_t)}</b>")
+        next_guides.append(f"  • {tag}QQQ <b>${d1_px:.2f}</b> 이하 ({d1_pct:+.2f}%) → DIP1 <b>{wtxt(r.dip1_t)}</b>")
     elif eff_stage == 1 and not np.isnan(r.qh):
         d2_px = r.qh * (1.0 + P["dip2"] / 100.0)
         d2_pct = (d2_px / r.qc - 1.0) * 100.0
         tag = "🚨 <b>임박!</b> " if (r.dd - P["dip2"]) <= 3.0 else ""
-        next_guides.append(f"• {tag}QQQ <b>${d2_px:.2f}</b> 이하 ({d2_pct:+.2f}%) → DIP2 <b>{wtxt(r.dip2_t)}</b>")
+        next_guides.append(f"  • {tag}QQQ <b>${d2_px:.2f}</b> 이하 ({d2_pct:+.2f}%) → DIP2 <b>{wtxt(r.dip2_t)}</b>")
         if r.z200 > P["dip2_z200_max"] and not np.isnan(r.ma200):
-            next_guides.append(f"  (TQQQ ${r.ma200 * 0.93:.2f} 이하 동시 필요)")
+            next_guides.append(f"    (TQQQ ${r.ma200 * 0.93:.2f} 이하 동시 필요)")
+
     if eff_stage >= 1 and not np.isnan(eff_avg) and manual_shares != "0":
         if not eff_t1:
-            next_guides.append(f"• TQQQ <b>${eff_avg * (1.0 + P['tp1'] / 100.0):.2f}</b> 이상 → TP1 (50% 매도)")
+            tp1_px = eff_avg * (1.0 + P["tp1"] / 100.0)
+            tp1_pct = (tp1_px / r.c - 1.0) * 100.0
+            next_guides.append(f"  • TQQQ <b>${tp1_px:.2f}</b> 이상 ({tp1_pct:+.2f}%) → TP1 (50% 매도)")
         elif not r.t2:
-            next_guides.append(f"• TQQQ <b>${eff_avg * (1.0 + P['tp2'] / 100.0):.2f}</b> 이상 → TP2 (35% 매도)")
-    if eff_stage >= 1 and r.gap * 100.0 < 1.5:
-        next_guides.append(f"• ⚠️ 5/220MA 갭 {fmt(r.gap * 100, 2, True)} (-0.10% 시 DC)")
+            tp2_px = eff_avg * (1.0 + P["tp2"] / 100.0)
+            tp2_pct = (tp2_px / r.c - 1.0) * 100.0
+            next_guides.append(f"  • TQQQ <b>${tp2_px:.2f}</b> 이상 ({tp2_pct:+.2f}%) → TP2 (35% 매도)")
+
+    # DC 경고는 실제로 위에서 -0.10%로 근접했을 때만 표시
+    if eff_stage >= 1 and -0.10 < r.gap * 100.0 < 1.5:
+        next_guides.append(f"  • ⚠️ 5/220MA 갭 <b>{fmt(r.gap * 100, 2, True)}</b> (-0.10% 시 DC)")
 
     if next_guides:
-        lines += ["🔔 <b>다음 기준가</b>", *next_guides, ""]
+        lines += ["🔔 <b>다음 행동 기준</b>", *next_guides, ""]
 
-    # 3. 한눈에 들어오는 짧은 수치 (모바일 줄바꿈 방지)
+    # 3. 핵심 지표
+    avg_label = "실제평단" if has_manual_avg else "전략평단"
     lines += [
-        "──────────",
-        f"• <b>TQQQ</b> ${fmt(r.c)} ({fmt(chg_t, 2, True)})",
-        f"• <b>QQQ</b> ${fmt(r.qc)} ({fmt(chg_q, 2, True)}) | DD <b>{fmt(r.dd, 2, True)}</b>",
-        f"• <b>RSI</b> {fmt(r.rsi, 1)} | <b>VIX비</b> {fmt(r.vr)} ({fmt(r.trig, 0, True)})",
-        f"• <b>Z200</b> {fmt(r.z200, 2, True)} | <b>GC</b> {fmt(r.gap * 100, 2, True)}",
+        "📊 <b>핵심 지표</b>",
+        f"  • TQQQ  <b>${fmt(r.c)}</b> ({fmt(chg_t, 2, True)})",
+        f"  • QQQ   <b>${fmt(r.qc)}</b> ({fmt(chg_q, 2, True)}) · 낙폭 <b>{fmt(r.dd, 2, True)}</b>",
+        f"  • RSI   <b>{fmt(r.rsi, 1)}</b> · VIX비 <b>{fmt(r.vr)}</b> (기준 {fmt(r.trig, 0, True)})",
+        f"  • Z200  {fmt(r.z200, 2, True)} · 5/220갭 {fmt(r.gap * 100, 2, True)}",
     ]
     if eff_stage >= 1 and not np.isnan(eff_avg) and manual_shares != "0":
-        lines.append(f"• <b>{'실제평단' if has_manual_avg else '전략평단'}</b> ${fmt(eff_avg)} ({fmt((r.c / eff_avg - 1) * 100, 2, True)})")
+        lines.append(f"  • {avg_label} <b>${fmt(eff_avg)}</b> ({fmt((r.c / eff_avg - 1) * 100, 2, True)})")
 
     for w in (warnings or []):
-        lines.append(f"⚠️ {html.escape(str(w))}")
+        lines.append(f"\n⚠️ {html.escape(str(w))}")
     return "\n".join(lines)
 
 
